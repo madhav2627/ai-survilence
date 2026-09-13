@@ -324,6 +324,7 @@ def _run_detection_worker(
         )
 
         # ── Immediately delete temporary input video from /tmp ───────────────
+        t_clean_0 = time.time()
         if Path(input_path).exists():
             try:
                 Path(input_path).unlink()
@@ -335,6 +336,8 @@ def _run_detection_worker(
         if input_blob_url:
             _delete_blob_object(input_blob_url)
             print(f"[Blob] Deleted temporary input blob: {input_blob_url[:80]}", flush=True)
+        t_cleanup = time.time() - t_clean_0
+        print(f"[PERF] Cleanup: {t_cleanup:.3f}s", flush=True)
 
         # Save analysis metadata and report to database
         analysis_data = {
@@ -593,6 +596,7 @@ def analyze():
 
         try:
             print(f"[Blob] Downloading {blob_url[:80]}... to {input_path}", flush=True)
+            t_b0 = time.time()
             headers = {}
             token = os.environ.get("BLOB_READ_WRITE_TOKEN", "") or BLOB_READ_WRITE_TOKEN
             if token:
@@ -614,12 +618,17 @@ def analyze():
                             }), 400
 
                 total = 0
+                t_f0 = time.time()
                 with open(input_path, "wb") as fout:
                     for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
                         if chunk:
                             fout.write(chunk)
                             total += len(chunk)
-            print(f"[Blob] Downloaded {total / 1_048_576:.1f} MB", flush=True)
+                t_file_create = time.time() - t_f0
+
+            t_blob_download = time.time() - t_b0
+            print(f"[PERF] Blob download: {t_blob_download:.3f}s ({total / 1_048_576:.2f} MB @ {(total / 1_048_576) / max(t_blob_download, 0.001):.2f} MB/s)", flush=True)
+            print(f"[PERF] Temporary file creation: {t_file_create:.3f}s", flush=True)
         except Exception as exc:
             try:
                 if Path(input_path).exists():

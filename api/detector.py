@@ -294,10 +294,41 @@ def get_yolo_detector():
     # 1. Primary: ONNX Runtime loading vehicle_traffic.onnx
     if MODEL_ONNX.exists():
         try:
+            t_load_0 = time.time()
             import onnxruntime as ort
-            sess = ort.InferenceSession(str(MODEL_ONNX), providers=["CPUExecutionProvider"])
-            print(f"[Detector] Loaded ONNX UVH-26: {MODEL_ONNX}", flush=True)
-            _cached_detector = ("onnx", sess)
+            sess_opts = ort.SessionOptions()
+            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            # Set thread pool to available hardware concurrency (max 4 on serverless)
+            try:
+                cpu_cnt = os.cpu_count() or 2
+                sess_opts.intra_op_num_threads = min(cpu_cnt, 4)
+            except Exception:
+                sess_opts.intra_op_num_threads = 2
+
+            sess = ort.InferenceSession(str(MODEL_ONNX), sess_options=sess_opts, providers=["CPUExecutionProvider"])
+            t_onnx_init = time.time() - t_load_0
+
+            active_providers = sess.get_providers()
+            inputs = sess.get_inputs()
+            inp_name = inputs[0].name
+            inp_shape = inputs[0].shape
+            in_h = inp_shape[2] if len(inp_shape) > 2 and isinstance(inp_shape[2], int) else 640
+            in_w = inp_shape[3] if len(inp_shape) > 3 and isinstance(inp_shape[3], int) else 640
+
+            # Measure first inference (warmup graph compilation)
+            dummy = np.zeros((1, 3, in_h, in_w), dtype=np.float32)
+            t_first_0 = time.time()
+            _ = sess.run(None, {inp_name: dummy})
+            t_first_infer = time.time() - t_first_0
+
+            print(f"[PERF] ONNX initialization: {t_onnx_init:.3f}s", flush=True)
+            print(f"[PERF] First inference: {t_first_infer:.3f}s", flush=True)
+            print(f"[AI] Providers: {active_providers}", flush=True)
+            print(f"[AI] Model input name: {inp_name}, shape: [1, 3, {in_h}, {in_w}]", flush=True)
+            print(f"[Detector] Loaded ONNX UVH-26: {MODEL_ONNX} (cached once per process)", flush=True)
+
+            _cached_detector = ("onnx", sess, inp_name, in_h, in_w)
             return _cached_detector
         except Exception as e:
             print(f"[Detector] ONNX load error ({e})", flush=True)
@@ -306,9 +337,12 @@ def get_yolo_detector():
     if MODEL_PT.exists():
         try:
             from ultralytics import YOLO
+            t_pt_0 = time.time()
             model = YOLO(str(MODEL_PT))
+            t_pt_init = time.time() - t_pt_0
+            print(f"[PERF] PyTorch model initialization: {t_pt_init:.3f}s", flush=True)
             print(f"[Detector] Loaded PyTorch UVH-26: {MODEL_PT}", flush=True)
-            _cached_detector = ("ultralytics", model)
+            _cached_detector = ("ultralytics", model, None, 640, 640)
             return _cached_detector
         except Exception as e:
             pass
@@ -318,13 +352,15 @@ def get_yolo_detector():
 def run_inference_on_frame(detector, frame, conf_thresh=0.20, imgsz=512):
     """
     Returns list of detections: [dict(box=[x1,y1,x2,y2], score=float, class=str)]
+    Fast, vectorized preprocessing and postprocessing.
     """
-    engine_type, model = detector
+    engine_type = detector[0]
     h, w = frame.shape[:2]
     min_box_area = 0.00025 * (w * h)
     detections = []
 
     if engine_type == "ultralytics":
+        model = detector[1]
         results = model(frame, conf=conf_thresh, imgsz=imgsz, verbose=False)[0]
         if results.boxes is not None and len(results.boxes) > 0:
             boxes = results.boxes
@@ -348,14 +384,12 @@ def run_inference_on_frame(detector, frame, conf_thresh=0.20, imgsz=512):
                 })
 
     elif engine_type == "onnx":
-        inp_shape = model.get_inputs()[0].shape
-        in_h = inp_shape[2] if len(inp_shape) > 2 and isinstance(inp_shape[2], int) else 640
-        in_w = inp_shape[3] if len(inp_shape) > 3 and isinstance(inp_shape[3], int) else 640
-        resized = cv2.resize(frame, (in_w, in_h))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        inp = np.transpose(rgb, (2, 0, 1))[np.newaxis, ...] # (1, 3, in_h, in_w)
-        input_name = model.get_inputs()[0].name
-        outs = model.run(None, {input_name: inp})[0] # (1, 18, 8400)
+        sess, inp_name, in_h, in_w = detector[1], detector[2], detector[3], detector[4]
+
+        # Fast OpenCV C++ preprocessing (resizes, converts BGR->RGB, scales by 1/255.0, transposes to NCHW)
+        inp = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (in_w, in_h), (0, 0, 0), swapRB=True, crop=False)
+
+        outs = sess.run(None, {inp_name: inp})[0] # (1, 18, 8400)
         preds = outs[0] # (18, 8400)
         boxes_raw = preds[:4, :].T # (8400, 4) in cx, cy, w, h
         scores_raw = preds[4:, :].T # (8400, 14)
@@ -367,41 +401,42 @@ def run_inference_on_frame(detector, frame, conf_thresh=0.20, imgsz=512):
         filtered_scores = max_scores[mask]
         filtered_classes = max_classes[mask]
 
-        scale_x = w / float(in_w)
-        scale_y = h / float(in_h)
+        if len(filtered_boxes) > 0:
+            scale_x = w / float(in_w)
+            scale_y = h / float(in_h)
 
-        # Mapping of UVH-26 14 classes in alphabetical order
-        UVH26_NAMES = [
-            "Bus", "Hatchback", "LCV", "MUV", "Mini-bus", "Others", "SUV",
-            "Sedan", "Three-wheeler", "Truck", "Two-wheeler", "Van", "bicycle", "tempo-traveller"
-        ]
+            # Mapping of UVH-26 14 classes in alphabetical order
+            UVH26_NAMES = [
+                "Bus", "Hatchback", "LCV", "MUV", "Mini-bus", "Others", "SUV",
+                "Sedan", "Three-wheeler", "Truck", "Two-wheeler", "Van", "bicycle", "tempo-traveller"
+            ]
 
-        # NMS
-        nms_boxes = []
-        for b in filtered_boxes:
-            cx, cy, bw, bh = b
-            x1 = int((cx - bw / 2.0) * scale_x)
-            y1 = int((cy - bh / 2.0) * scale_y)
-            x2 = int((cx + bw / 2.0) * scale_x)
-            y2 = int((cy + bh / 2.0) * scale_y)
-            nms_boxes.append([x1, y1, x2 - x1, y2 - y1])
+            # Vectorized NMS box calculation avoiding Python loop overhead
+            cx = filtered_boxes[:, 0]
+            cy = filtered_boxes[:, 1]
+            bw = filtered_boxes[:, 2]
+            bh = filtered_boxes[:, 3]
+            x1 = ((cx - bw / 2.0) * scale_x).astype(int)
+            y1 = ((cy - bh / 2.0) * scale_y).astype(int)
+            w_box = (bw * scale_x).astype(int)
+            h_box = (bh * scale_y).astype(int)
+            nms_boxes = np.stack([x1, y1, w_box, h_box], axis=1).tolist()
 
-        indices = cv2.dnn.NMSBoxes(nms_boxes, filtered_scores.tolist(), conf_thresh, 0.45)
-        if len(indices) > 0:
-            for idx in indices.flatten():
-                bx, by, bw, bh = nms_boxes[idx]
-                x1, y1, x2, y2 = bx, by, bx + bw, by + bh
-                area = bw * bh
-                if area < min_box_area:
-                    continue
-                cls_idx = filtered_classes[idx]
-                source_name = UVH26_NAMES[cls_idx] if cls_idx < len(UVH26_NAMES) else "Others"
-                app_class = app_label_from_source(source_name) or "car"
-                detections.append({
-                    "box": [x1, y1, x2, y2],
-                    "score": float(filtered_scores[idx]),
-                    "class": app_class,
-                })
+            indices = cv2.dnn.NMSBoxes(nms_boxes, filtered_scores.tolist(), conf_thresh, 0.45)
+            if len(indices) > 0:
+                for idx in indices.flatten():
+                    bx, by, bw, bh = nms_boxes[idx]
+                    area = bw * bh
+                    if area < min_box_area:
+                        continue
+                    cls_idx = filtered_classes[idx]
+                    source_name = UVH26_NAMES[cls_idx] if cls_idx < len(UVH26_NAMES) else "Others"
+                    app_class = app_label_from_source(source_name) or "car"
+                    detections.append({
+                        "box": [bx, by, bx + bw, by + bh],
+                        "score": float(filtered_scores[idx]),
+                        "class": app_class,
+                    })
 
     return detections
 
@@ -425,14 +460,19 @@ def process_video_analysis(
     if not detector:
         raise RuntimeError("UVH-26 YOLO model (vehicle_traffic.pt / onnx) could not be loaded on server.")
 
+    t_vopen_0 = time.time()
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open uploaded video file: {input_path}")
+    t_video_open = time.time() - t_vopen_0
+    print(f"[PERF] Video open: {t_video_open:.3f}s", flush=True)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    video_dur = round(float(total_frames / fps), 2) if fps > 0 and total_frames > 0 else 0.0
+    print(f"[PERF] Video metadata: {orig_w}x{orig_h} @ {fps:.1f} FPS, {total_frames} frames, {video_dur}s", flush=True)
 
     scale = min(1.0, float(max_dim) / max(orig_w, orig_h)) if max(orig_w, orig_h) > max_dim else 1.0
     width = int(orig_w * scale)
@@ -452,21 +492,41 @@ def process_video_analysis(
     if progress_callback:
         progress_callback(10, "Extracting video frames and initializing detector...")
 
+    # Stage timing accumulators
+    total_decoding_time = 0.0
+    total_resizing_time = 0.0
+    total_inference_time = 0.0
+    total_tracking_time = 0.0
+    inferred_frames = 0
+
+    t_pass1_start = time.time()
+
     # Pass 1: Tracking and Detection
     while True:
+        t_d0 = time.time()
         ok, frame = cap.read()
         if not ok:
             break
+        total_decoding_time += (time.time() - t_d0)
         frame_number += 1
-
-        if scale < 1.0:
-            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
         should_infer = (frame_number % stride == 0) or (frame_number == 1)
 
         if should_infer:
+            # Only resize frames that are actually fed to the AI pipeline
+            if scale < 1.0:
+                t_r0 = time.time()
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+                total_resizing_time += (time.time() - t_r0)
+
+            t_inf0 = time.time()
             dets = run_inference_on_frame(detector, frame, conf_thresh=0.20, imgsz=512)
+            total_inference_time += (time.time() - t_inf0)
+            inferred_frames += 1
+
+            t_tr0 = time.time()
             active_tracks = tracker.update(dets)
+            total_tracking_time += (time.time() - t_tr0)
 
             current_active = len(active_tracks)
             cached_draw_items = []
@@ -509,17 +569,23 @@ def process_video_analysis(
             per_frame_draw_items.append(cached_draw_items)
             per_frame_active_counts.append(current_active)
         else:
-            # Repeat previous frame's items for smooth video
+            # On skipped frames, reuse previous frame's items for smooth video
             per_frame_draw_items.append(per_frame_draw_items[-1] if per_frame_draw_items else [])
             per_frame_active_counts.append(per_frame_active_counts[-1] if per_frame_active_counts else 0)
 
-        # Progress reporting
-        if total_frames > 0 and frame_number % 10 == 0:
-            pct = 10 + int((frame_number / total_frames) * 60) # 10% to 70%
+        # Real Progress Telemetry
+        if total_frames > 0 and (frame_number % 10 == 0 or frame_number == total_frames):
+            elapsed_so_far = max(time.time() - t_pass1_start, 0.001)
+            processing_fps = frame_number / elapsed_so_far
+            remaining_frames = max(total_frames - frame_number, 0)
+            remaining_sec = remaining_frames / processing_fps if processing_fps > 0 else 0
+            pct = 10 + int((frame_number / total_frames) * 65) # 10% to 75%
+            print(f"[PERF] Progress: {frame_number} / {total_frames} | Processing FPS: {processing_fps:.1f} | Elapsed: {elapsed_so_far:.1f}s | Estimated remaining: {remaining_sec:.1f}s", flush=True)
             if progress_callback:
                 progress_callback(pct, f"Detecting & tracking vehicles ({frame_number}/{total_frames} frames)...")
 
     cap.release()
+    t_pass1 = time.time() - t_pass1_start
 
     # Determine persistent confirmed tracks (seen on >= 2 inference frames)
     confirmed_track_ids = {
@@ -546,6 +612,7 @@ def process_video_analysis(
         progress_callback(75, f"Tracking complete ({authoritative_total} unique vehicles). Rendering output HUD...")
 
     # Pass 2: Render Annotated Video
+    t_pass2_start = time.time()
     cap2 = cv2.VideoCapture(input_path)
     raw_output = str(Path(output_video_path).with_name(f"raw_{Path(output_video_path).name}"))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -555,14 +622,18 @@ def process_video_analysis(
         writer = cv2.VideoWriter(raw_output, fourcc, fps, (width, height))
 
     frame_idx = 0
+    total_draw_time = 0.0
+    total_encode_time = 0.0
+
     while True:
         ok, frame = cap2.read()
         if not ok or frame_idx >= len(per_frame_draw_items):
             break
 
         if scale < 1.0:
-            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
 
+        t_dr0 = time.time()
         # Draw bounding boxes
         for item in per_frame_draw_items[frame_idx]:
             x1, y1, x2, y2, cx, cy, color, text, tid = item
@@ -598,17 +669,22 @@ def process_video_analysis(
                 text_color = (160, 175, 200)
             cv2.putText(frame, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 2)
             y += 27
+        total_draw_time += (time.time() - t_dr0)
 
+        t_en0 = time.time()
         writer.write(frame)
+        total_encode_time += (time.time() - t_en0)
         frame_idx += 1
 
     cap2.release()
     writer.release()
+    t_pass2 = time.time() - t_pass2_start
 
     if progress_callback:
         progress_callback(90, "Re-encoding web-compatible video...")
 
-    # Video compression / H.264
+    # Video compression / H.264 final preparation
+    t_prep_0 = time.time()
     ffmpeg_bin = shutil.which("ffmpeg")
     if ffmpeg_bin and Path(raw_output).exists():
         temp_h264 = str(Path(output_video_path).with_name(f"h264_{Path(output_video_path).name}"))
@@ -632,6 +708,7 @@ def process_video_analysis(
     else:
         if Path(raw_output).exists():
             shutil.move(raw_output, output_video_path)
+    t_final_prep = time.time() - t_prep_0
 
     # Metrics aggregation
     elapsed = max(time.time() - start_time, 0.01)
@@ -642,8 +719,6 @@ def process_video_analysis(
     for v in final_vehicles_detail:
         if v.get("direction") in ("UP", "DOWN"):
             direction_counts[v["direction"]] += 1
-
-    video_dur = round(float(total_frames / fps), 2) if fps > 0 and total_frames > 0 else 0.0
 
     report = {
         "session_id": session_id,
@@ -692,8 +767,24 @@ def process_video_analysis(
         "vehicles_detail": final_vehicles_detail,
     }
 
+    t_rep_0 = time.time()
     with open(output_report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
+    t_rep_time = time.time() - t_rep_0
+
+    # Log exact [PERF] stage breakdown as required
+    avg_inf_per_frame = (total_inference_time / inferred_frames) if inferred_frames > 0 else 0.0
+    avg_trk_per_frame = (total_tracking_time / inferred_frames) if inferred_frames > 0 else 0.0
+    print(f"[PERF] Frame decoding: {total_decoding_time:.3f}s", flush=True)
+    print(f"[PERF] Frame resizing: {total_resizing_time:.3f}s", flush=True)
+    print(f"[PERF] Average inference: {avg_inf_per_frame:.3f}s/frame", flush=True)
+    print(f"[PERF] Average tracking: {avg_trk_per_frame:.4f}s/frame", flush=True)
+    print(f"[PERF] Inferred frames: {inferred_frames} (stride={stride})", flush=True)
+    print(f"[PERF] Annotation/drawing: {total_draw_time:.3f}s", flush=True)
+    print(f"[PERF] Encoding: {t_pass2 + t_final_prep:.3f}s", flush=True)
+    print(f"[PERF] Report generation: {t_rep_time:.3f}s", flush=True)
+    print(f"[PERF] Final file preparation: {t_final_prep:.3f}s", flush=True)
+    print(f"[PERF] Total: {elapsed:.3f}s", flush=True)
 
     if progress_callback:
         progress_callback(100, "Analysis complete")
