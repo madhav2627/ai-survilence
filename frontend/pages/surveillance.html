@@ -351,16 +351,24 @@ async function startAnalysis() {
     }
   } catch (err) {
     if (startBtn) startBtn.disabled = false;
-    try {
-      const activeRes = await ApiClient.getActiveJob();
-      if (activeRes && activeRes.job && activeRes.job.sessionId) {
-        currentSessionId = activeRes.job.sessionId;
-        document.getElementById('session-badge').textContent = currentSessionId;
-        appendTerminalLine(`[AI Engine] Reconnected to active session: ${currentSessionId}`);
-        pollJobProgress(currentSessionId);
-        return;
-      }
-    } catch {}
+    appendTerminalLine('[AI Engine] Verifying job state on server...');
+    let reconnected = false;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        await new Promise(r => setTimeout(r, 1200));
+        const activeRes = await ApiClient.getActiveJob();
+        if (activeRes && activeRes.job && (activeRes.job.sessionId || activeRes.job.analysisId)) {
+          currentSessionId = activeRes.job.sessionId || activeRes.job.analysisId;
+          document.getElementById('session-badge').textContent = currentSessionId;
+          appendTerminalLine(`[AI Engine] Reconnected to active session: ${currentSessionId}`);
+          pollJobProgress(currentSessionId);
+          reconnected = true;
+          break;
+        }
+      } catch {}
+    }
+    if (reconnected) return;
+
     if (err.message && err.message.includes('already in progress')) {
       Toast.warning('Already Processing', err.message);
       resetToUpload();
@@ -376,7 +384,7 @@ function pollJobProgress(sessionId) {
   if (_pollTimer) clearInterval(_pollTimer);
 
   let attempts = 0;
-  const maxAttempts = 180; // 6 minutes max
+  const maxAttempts = 240; // 6 minutes max
 
   _pollTimer = setInterval(async () => {
     attempts++;
@@ -412,7 +420,7 @@ function pollJobProgress(sessionId) {
     } catch (err) {
       // Ignore transient fetch errors while function is working
     }
-  }, 2000);
+  }, 1500);
 }
 
 let _lastLoggedStage = '';

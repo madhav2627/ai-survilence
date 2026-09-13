@@ -85,6 +85,13 @@ def get_current_user_id() -> str | None:
         or request.args.get("user_id")
         or request.form.get("user_id")
     )
+    if not raw and request.is_json:
+        try:
+            body = request.get_json(silent=True)
+            if body and isinstance(body, dict):
+                raw = body.get("user_id") or body.get("userId")
+        except Exception:
+            pass
     if not raw:
         return None
     cleaned = "".join(c for c in str(raw).strip() if c.isalnum() or c in ("_", "-"))
@@ -566,8 +573,7 @@ def analyze():
         output_path = str(RESULTS_DIR / f"{session_id}_output.mp4")
         report_path = str(REPORTS_DIR / f"{session_id}_report.json")
 
-        # Retention: remove older physical videos for this user before download
-        removed_previous = _remove_previous_physical_videos(user_id, session_id)
+        # Serverless disk protection: clean stale files before download
         _cleanup_tmp_storage()
 
         try:
@@ -714,7 +720,7 @@ def active_job():
         with _threads_lock:
             t = _active_threads.get(job["jobId"])
         if t and t.is_alive():
-            t.join(timeout=1.5)
+            t.join(timeout=2.5)
             job = db.get_active_job(user_id) or job
     return jsonify({"job": job, "active": bool(job)})
 

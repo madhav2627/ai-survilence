@@ -32,12 +32,30 @@ _lock = threading.Lock()
 # ── Storage Backend Detection ───────────────────────────────────────────────
 
 def _get_database_url() -> str | None:
-    return os.environ.get("POSTGRES_URL") or os.environ.get("DATABASE_URL")
+    return (
+        os.environ.get("POSTGRES_URL_NON_POOLING")
+        or os.environ.get("POSTGRES_URL")
+        or os.environ.get("DATABASE_URL")
+    )
 
 def is_postgres() -> bool:
     return bool(_get_database_url())
 
+_pg_conn = None
+
 def _get_pg_conn():
+    global _pg_conn
+    if _pg_conn is not None:
+        try:
+            _pg_conn.run("SELECT 1")
+            return _pg_conn
+        except Exception:
+            try:
+                _pg_conn.close()
+            except Exception:
+                pass
+            _pg_conn = None
+
     url = _get_database_url()
     if not url:
         return None
@@ -45,14 +63,17 @@ def _get_pg_conn():
     import pg8000.native
     u = urlparse(url)
     ctx = ssl.create_default_context()
-    return pg8000.native.Connection(
+    dbname = u.path.lstrip("/").split("?")[0]
+    _pg_conn = pg8000.native.Connection(
         user=u.username,
         password=u.password,
         host=u.hostname,
         port=u.port or 5432,
-        database=u.path.lstrip("/"),
-        ssl_context=ctx
+        database=dbname,
+        ssl_context=ctx,
+        timeout=8
     )
+    return _pg_conn
 
 def _get_sqlite_conn():
     conn = sqlite3.connect(str(SQLITE_PATH), check_same_thread=False)
@@ -87,21 +108,26 @@ def _normalize_row(row_dict: dict) -> dict:
     return d
 
 def _query_all(sql: str, params: tuple = ()) -> list[dict]:
+    global _pg_conn
     with _lock:
         if is_postgres():
             try:
                 con = _get_pg_conn()
-                new_sql, kw = _convert_placeholders(sql, params)
-                raw_rows = con.run(new_sql, **kw)
-                if raw_rows and con.columns:
-                    col_names = [c["name"] for c in con.columns]
-                    results = [_normalize_row(dict(zip(col_names, r))) for r in raw_rows]
-                else:
-                    results = []
-                con.close()
-                return results
+                if con:
+                    new_sql, kw = _convert_placeholders(sql, params)
+                    raw_rows = con.run(new_sql, **kw)
+                    if raw_rows and con.columns:
+                        col_names = [c["name"] for c in con.columns]
+                        return [_normalize_row(dict(zip(col_names, r))) for r in raw_rows]
+                    return []
             except Exception as e:
                 print(f"[DB] Postgres query_all error ({e}), falling back to SQLite", flush=True)
+                if _pg_conn:
+                    try:
+                        _pg_conn.close()
+                    except Exception:
+                        pass
+                    _pg_conn = None
 
         conn = _get_sqlite_conn()
         try:
@@ -115,26 +141,31 @@ def _query_one(sql: str, params: tuple = ()) -> dict | None:
     return rows[0] if rows else None
 
 def _execute(sql: str, params: tuple = ()) -> int:
+    global _pg_conn
     with _lock:
         if is_postgres():
             try:
                 con = _get_pg_conn()
-                # Handle SQLite-specific INSERT OR REPLACE
-                if "INSERT OR REPLACE INTO" in sql:
-                    # e.g. INSERT OR REPLACE INTO table (cols) VALUES (?, ?) -> DELETE WHERE id = ? then INSERT
-                    table = sql.split("INSERT OR REPLACE INTO")[1].split("(")[0].strip()
-                    con.run(f"DELETE FROM {table} WHERE id = :p0", p0=str(params[0]))
-                    mod_sql = sql.replace("INSERT OR REPLACE INTO", "INSERT INTO")
-                    new_sql, kw = _convert_placeholders(mod_sql, params)
-                else:
-                    new_sql, kw = _convert_placeholders(sql, params)
+                if con:
+                    # Handle SQLite-specific INSERT OR REPLACE
+                    if "INSERT OR REPLACE INTO" in sql:
+                        table = sql.split("INSERT OR REPLACE INTO")[1].split("(")[0].strip()
+                        con.run(f"DELETE FROM {table} WHERE id = :p0", p0=str(params[0]))
+                        mod_sql = sql.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+                        new_sql, kw = _convert_placeholders(mod_sql, params)
+                    else:
+                        new_sql, kw = _convert_placeholders(sql, params)
 
-                con.run(new_sql, **kw)
-                count = con.row_count or 0
-                con.close()
-                return count
+                    con.run(new_sql, **kw)
+                    return con.row_count or 0
             except Exception as e:
                 print(f"[DB] Postgres execute error ({e}), falling back to SQLite", flush=True)
+                if _pg_conn:
+                    try:
+                        _pg_conn.close()
+                    except Exception:
+                        pass
+                    _pg_conn = None
 
         conn = _get_sqlite_conn()
         try:
