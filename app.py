@@ -246,6 +246,20 @@ def auth_profile():
 # VIDEO ANALYSIS PIPELINE (REAL MODEL EXECUTION)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _cleanup_tmp_storage():
+    """Ensure /tmp doesn't accumulate orphaned or failed files."""
+    for d in [UPLOAD_DIR, RESULTS_DIR, REPORTS_DIR]:
+        try:
+            if d.exists():
+                for p in d.iterdir():
+                    if p.is_file():
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
 def _remove_previous_physical_videos(user_id: str, keep_session_id: str) -> int:
     """Delete retained physical input/output videos from older analyses.
 
@@ -552,6 +566,10 @@ def analyze():
         output_path = str(RESULTS_DIR / f"{session_id}_output.mp4")
         report_path = str(REPORTS_DIR / f"{session_id}_report.json")
 
+        # Retention: remove older physical videos for this user before download
+        removed_previous = _remove_previous_physical_videos(user_id, session_id)
+        _cleanup_tmp_storage()
+
         try:
             print(f"[Blob] Downloading {blob_url[:80]}... to {input_path}", flush=True)
             headers = {}
@@ -560,6 +578,20 @@ def analyze():
                 headers["Authorization"] = f"Bearer {token}"
             with _requests.get(blob_url, headers=headers, stream=True, timeout=180) as r:
                 r.raise_for_status()
+
+                # Check Content-Length against available disk space
+                cl = r.headers.get("Content-Length")
+                if cl and cl.isdigit():
+                    expected_bytes = int(cl)
+                    _, _, free_b = shutil.disk_usage(str(TMP_DIR))
+                    if expected_bytes > free_b:
+                        _cleanup_tmp_storage()
+                        _, _, free_b = shutil.disk_usage(str(TMP_DIR))
+                        if expected_bytes > free_b:
+                            return jsonify({
+                                "error": f"Video size ({expected_bytes / 1_048_576:.1f} MB) exceeds available serverless disk space ({free_b / 1_048_576:.1f} MB). Please use a video clip under 450 MB."
+                            }), 400
+
                 total = 0
                 with open(input_path, "wb") as fout:
                     for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
@@ -568,14 +600,16 @@ def analyze():
                             total += len(chunk)
             print(f"[Blob] Downloaded {total / 1_048_576:.1f} MB", flush=True)
         except Exception as exc:
+            try:
+                if Path(input_path).exists():
+                    Path(input_path).unlink()
+            except Exception:
+                pass
+            print(f"[Blob] Download error: {exc}", flush=True)
             return jsonify({"error": f"Failed to retrieve uploaded video from Blob: {exc}"}), 500
 
         if not Path(input_path).exists() or Path(input_path).stat().st_size == 0:
             return jsonify({"error": "Downloaded video is empty or missing"}), 400
-
-        # Retention: remove older physical videos for this user
-        removed_previous = _remove_previous_physical_videos(user_id, session_id)
-        print(f"[Storage] New session {session_id}: removed {removed_previous} previous physical file(s)", flush=True)
 
         job = db.create_job(user_id, session_id, orig_name)
 
