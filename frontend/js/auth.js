@@ -60,7 +60,7 @@ const Auth = {
 
   requireAuth() {
     if (!Auth.isAuthenticated()) {
-      window.location.href = '/login.html';
+     window.location.href = '/login';
       return false;
     }
     return true;
