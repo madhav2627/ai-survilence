@@ -99,10 +99,12 @@ def index_page():
     return send_from_directory(str(FRONTEND_DIR), "index.html")
 
 @app.route("/login")
+@app.route("/login.html")
 def login_page():
     return send_from_directory(str(FRONTEND_DIR), "login.html")
 
 @app.route("/register")
+@app.route("/register.html")
 def register_page():
     return send_from_directory(str(FRONTEND_DIR), "register.html")
 
@@ -118,14 +120,22 @@ PAGE_MAP = {
     "settings": "settings.html",
 }
 
-@app.route("/<page_name>")
+@app.route("/<path:page_name>")
 def named_page(page_name: str):
-    if page_name in PAGE_MAP:
-        return send_from_directory(str(FRONTEND_DIR / "pages"), PAGE_MAP[page_name])
-    # Fallback to direct HTML file if exists
-    target = FRONTEND_DIR / f"{page_name}.html"
-    if target.exists():
-        return send_from_directory(str(FRONTEND_DIR), f"{page_name}.html")
+    clean = page_name.strip("/")
+    direct_file = FRONTEND_DIR / clean
+    if direct_file.is_file():
+        return send_from_directory(str(FRONTEND_DIR), clean)
+    base = clean[:-5] if clean.endswith(".html") else clean
+    if base in PAGE_MAP:
+        return send_from_directory(str(FRONTEND_DIR / "pages"), PAGE_MAP[base])
+    page_file = FRONTEND_DIR / "pages" / clean
+    if page_file.is_file():
+        return send_from_directory(str(FRONTEND_DIR / "pages"), clean)
+    if not clean.endswith(".html"):
+        page_html = FRONTEND_DIR / "pages" / f"{clean}.html"
+        if page_html.is_file():
+            return send_from_directory(str(FRONTEND_DIR / "pages"), f"{clean}.html")
     abort(404)
 
 @app.route("/pages/<path:filename>")
