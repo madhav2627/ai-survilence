@@ -652,31 +652,17 @@ def analyze():
             _active_threads[job["jobId"]] = t
         t.start()
 
-        # Allow thread to start and verify initialization without risking 504 timeout
-        t.join(timeout=2.0)
-
-        # Check if already completed
-        completed = db.get_recently_completed_job(user_id)
-        if completed and completed.get("sessionId") == session_id:
-            return jsonify({
-                "sessionId": session_id,
-                "session_id": session_id,
-                "jobId": job["jobId"],
-                "status": "completed",
-                "filename": orig_name,
-                "stage": "Analysis complete",
-                "userId": user_id,
-            })
-
-        active = db.get_active_job(user_id)
+        # Return immediately so Vercel doesn't burn the 800s budget on this
+        # request. The worker thread will update DB progress as it processes.
+        # The frontend polls /api/active-job every 1.5s to track progress.
         return jsonify({
             "sessionId": session_id,
             "session_id": session_id,
             "jobId": job["jobId"],
             "status": "processing",
             "filename": orig_name,
-            "stage": active.get("stage", "Detecting & tracking vehicles...") if active else "Processing...",
-            "progress": active.get("progress", 10) if active else 10,
+            "stage": "Video received — starting AI pipeline...",
+            "progress": 5,
             "userId": user_id,
         })
 
@@ -740,12 +726,10 @@ def active_job():
     if not user_id:
         return jsonify({"job": None, "active": False})
     job = db.get_active_job(user_id)
-    if job and job.get("jobId"):
-        with _threads_lock:
-            t = _active_threads.get(job["jobId"])
-        if t and t.is_alive():
-            t.join(timeout=2.5)
-            job = db.get_active_job(user_id) or job
+    # Note: Do NOT do t.join() here — on Vercel each request is a new serverless
+    # instance and the in-memory _active_threads dict is always empty.  All state
+    # is persisted in the database by the worker thread, so a plain DB read is
+    # sufficient and avoids unnecessarily blocking the polling request.
     return jsonify({"job": job, "active": bool(job)})
 
 @app.route("/api/completed-job")

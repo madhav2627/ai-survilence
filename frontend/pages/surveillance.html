@@ -387,18 +387,23 @@ async function startAnalysis() {
 }
 
 let _pollTimer = null;
+let _pollNoProgressCount = 0;
 
 function pollJobProgress(sessionId) {
   if (_pollTimer) clearInterval(_pollTimer);
+  _pollNoProgressCount = 0;
 
   let attempts = 0;
-  const maxAttempts = 240; // 6 minutes max
+  const maxAttempts = 600; // 600 × 1.5s = 15 minutes (matches 800s Fluid Compute budget)
+  let lastProgress = 0;
+  let stalledAttempts = 0;
+  const maxStalledAttempts = 120; // ~3 min with no DB progress update = assume server died
 
   _pollTimer = setInterval(async () => {
     attempts++;
     if (attempts > maxAttempts) {
       clearInterval(_pollTimer);
-      showError('Analysis timed out. Please check your network connection.');
+      showError('Analysis exceeded the maximum wait time (15 minutes). The server execution limit was likely reached. Please try a shorter video clip.');
       return;
     }
 
@@ -407,9 +412,22 @@ function pollJobProgress(sessionId) {
       const activeRes = await ApiClient.getActiveJob();
       if (activeRes && activeRes.job && (activeRes.job.sessionId === sessionId || activeRes.job.analysisId === sessionId)) {
         const job = activeRes.job;
-        const prog = job.progress || 25;
+        const prog = job.progress || 5;
         const stage = job.stage || 'Detecting & tracking vehicles...';
         updateProcProgress(prog, stage);
+
+        // Stall detection: if progress hasn't moved in ~3 min, server may have died
+        if (prog > lastProgress) {
+          lastProgress = prog;
+          stalledAttempts = 0;
+        } else {
+          stalledAttempts++;
+          if (stalledAttempts >= maxStalledAttempts) {
+            clearInterval(_pollTimer);
+            showError('Analysis stopped progressing. The server execution limit was reached. Please try a shorter video clip.');
+            return;
+          }
+        }
         return;
       }
 
@@ -423,7 +441,15 @@ function pollJobProgress(sessionId) {
         Toast.success('Analysis complete', 'Vehicle detection finished successfully.');
       } else if (res && res.status === 'failed') {
         clearInterval(_pollTimer);
-        showError('Analysis failed on server. Please ensure the video is valid.');
+        const errMsg = res.error || 'Analysis failed on server. Please ensure the video is valid.';
+        showError(errMsg);
+      } else if (res && res.status !== 'processing') {
+        // Unknown state — keep polling a bit longer
+        stalledAttempts++;
+        if (stalledAttempts >= maxStalledAttempts) {
+          clearInterval(_pollTimer);
+          showError('Analysis stopped progressing. The server execution limit was reached. Please try a shorter video clip.');
+        }
       }
     } catch (err) {
       // Ignore transient fetch errors while function is working
