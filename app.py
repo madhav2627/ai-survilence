@@ -253,15 +253,22 @@ def auth_profile():
 # VIDEO ANALYSIS PIPELINE (REAL MODEL EXECUTION)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _cleanup_tmp_storage():
-    """Ensure /tmp doesn't accumulate orphaned or failed files."""
-    for d in [UPLOAD_DIR, RESULTS_DIR, REPORTS_DIR]:
+def _cleanup_tmp_storage(ttl_seconds: int = 3600):
+    """Ensure /tmp doesn't accumulate orphaned or abandoned video files.
+    - NEVER deletes reports, history JSON, user database, or model files.
+    - Deletes temporary video files in UPLOAD_DIR or RESULTS_DIR older than ttl_seconds (default 1 hour)
+      or 0-byte abandoned files.
+    """
+    now = time.time()
+    for d in [UPLOAD_DIR, RESULTS_DIR]:
         try:
             if d.exists():
                 for p in d.iterdir():
                     if p.is_file():
                         try:
-                            p.unlink()
+                            file_age = now - p.stat().st_mtime
+                            if file_age > ttl_seconds or p.stat().st_size == 0:
+                                p.unlink()
                         except Exception:
                             pass
         except Exception:
@@ -319,6 +326,19 @@ def _run_detection_worker(
             max_dim=1280
         )
 
+        # ── Immediately delete temporary input video from /tmp ───────────────
+        if Path(input_path).exists():
+            try:
+                Path(input_path).unlink()
+                print(f"[Storage] Deleted temporary input video: {input_path}", flush=True)
+            except Exception as exc:
+                print(f"[Storage] Could not delete input video {input_path}: {exc}", flush=True)
+
+        # ── Immediately delete temporary input blob from Vercel Blob ─────────
+        if input_blob_url:
+            _delete_blob_object(input_blob_url)
+            print(f"[Blob] Deleted temporary input blob: {input_blob_url[:80]}", flush=True)
+
         # Save analysis metadata and report to database
         analysis_data = {
             "sessionId": session_id,
@@ -333,15 +353,16 @@ def _run_detection_worker(
             "trucks": report.get("trucks", 0),
             "video_duration": report.get("video_duration", 0),
             "processing_time": report.get("processing_time_seconds", 0),
-            "input_video": input_path,
+            "input_video": "",
             "output_video": output_path,
             "report_path": report_path,
+            "video_available": 1,
         }
         db.add_analysis(user_id, analysis_data)
         db.save_report(user_id, session_id, report)
         db.complete_job(job_id, status="completed")
 
-        # ── Retention: delete older physical /tmp video files (keep newest only) ─
+        # ── Retention: delete older physical /tmp video files for this user ───
         entries = db.get_user_history(user_id)
         for e in entries:
             sid = e.get("sessionId")
@@ -353,34 +374,31 @@ def _run_detection_worker(
                             Path(p).unlink()
                         except Exception:
                             pass
-
-        # ── Blob retention: delete old input blob objects from Vercel Blob ──────
-        # The input video on Vercel Blob storage is no longer needed after
-        # processing; the output video lives on /tmp and is served via Flask.
-        # Delete the just-processed input blob first (already copied to /tmp).
-        if input_blob_url:
-            _delete_blob_object(input_blob_url)
-            print(f"[Blob] Deleted input blob {input_blob_url[:80]}", flush=True)
-
-        # Also delete any older input blob URLs recorded in history.
-        for e in entries:
-            sid = e.get("sessionId")
-            if sid != session_id:
                 old_blob = e.get("input_blob_url", "")
                 if old_blob and old_blob != input_blob_url:
                     _delete_blob_object(old_blob)
 
     except Exception as exc:
         print(f"[Detector Worker Error] {exc}", flush=True)
+        # Clean up temporary input and output files on error
+        for p in (input_path, output_path):
+            if p and Path(p).exists():
+                try:
+                    Path(p).unlink()
+                except Exception:
+                    pass
+        if input_blob_url:
+            _delete_blob_object(input_blob_url)
         db.complete_job(job_id, status="failed", error=str(exc))
         db.add_analysis(user_id, {
             "sessionId": session_id,
             "filename": orig_name,
             "status": "failed",
             "total_vehicles": 0,
-            "input_video": input_path,
+            "input_video": "",
             "output_video": "",
             "report_path": "",
+            "video_available": 0,
         })
     finally:
         with _threads_lock:
@@ -828,7 +846,37 @@ def download_video(session_id: str):
     out_path = analysis.get("output_video")
     if out_path and Path(out_path).exists():
         return send_file(str(out_path), as_attachment=True, download_name=f"tracked_{session_id}.mp4")
+    candidates = list(RESULTS_DIR.glob(f"{session_id}*.*"))
+    if candidates:
+        return send_file(str(candidates[0]), as_attachment=True, download_name=f"tracked_{session_id}.mp4")
     abort(404)
+
+@app.route("/api/video/<session_id>/cleanup", methods=["POST"])
+def cleanup_video(session_id: str):
+    user_id = get_current_user_id()
+    if not user_id:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    analysis = db.get_user_analysis(user_id, session_id)
+    if not analysis:
+        return jsonify({"ok": False, "error": "Analysis not found"}), 404
+
+    # Remove temporary output video file
+    out_path = analysis.get("output_video")
+    if out_path and Path(out_path).exists():
+        try:
+            Path(out_path).unlink()
+            print(f"[Storage] Safely cleaned up temporary output video after download: {out_path}", flush=True)
+        except Exception as e:
+            print(f"[Storage] Could not delete output video: {e}", flush=True)
+
+    for p in RESULTS_DIR.glob(f"{session_id}*.*"):
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+    db.mark_video_unavailable(user_id, session_id)
+    return jsonify({"ok": True, "cleaned": True})
 
 @app.route("/api/download/report/<session_id>")
 def download_report(session_id: str):

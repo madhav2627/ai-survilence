@@ -193,6 +193,12 @@
             <div class="surv-stat-item"><span class="surv-stat-label">Unknown</span><span id="s-dir-unk">—</span></div>
           </div>
 
+          <!-- Download processed video -->
+          <button id="dl-video-btn" class="btn btn-primary w-full" style="margin-top:var(--space-3)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Download Processed Video
+          </button>
+
           <!-- Download report -->
           <button id="dl-report-btn" class="btn btn-secondary w-full" style="margin-top:var(--space-2)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -258,6 +264,8 @@ function initSurveillance() {
   cancelBtn.addEventListener('click', cancelAnalysis);
   newBtn.addEventListener('click', resetToUpload);
   dlBtn.addEventListener('click', downloadReport);
+  const dlVidBtn = document.getElementById('dl-video-btn');
+  if (dlVidBtn) dlVidBtn.addEventListener('click', downloadProcessedVideo);
 
   // Check for session or camera in URL or active processing job
   const params = new URLSearchParams(window.location.search);
@@ -556,6 +564,26 @@ function downloadReport() {
   a.download = `survillence_report_${currentSessionId || Date.now()}.json`;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+function downloadProcessedVideo() {
+  if (!currentSessionId) {
+    Toast.warning('No video', 'No completed analysis session found.');
+    return;
+  }
+  const dlUrl = `/api/download/video/${currentSessionId}`;
+  const a = document.createElement('a');
+  a.href = dlUrl;
+  a.download = `tracked_${currentSessionId}.mp4`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  Toast.success('Download Started', 'Your processed video is downloading to your device.');
+
+  // Safe cleanup: after client has initiated download, notify backend to clean up temporary MP4
+  setTimeout(() => {
+    ApiClient._json(`/api/video/${currentSessionId}/cleanup`, { method: 'POST' }).catch(() => {});
+  }, 10000);
 }
 
 function showProcessing(filename) {

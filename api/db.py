@@ -650,6 +650,11 @@ def add_analysis(user_id: str, analysis: dict):
         )
     )
 
+def mark_video_unavailable(user_id: str, session_id: str) -> int:
+    if not user_id or not session_id:
+        return 0
+    return _execute("UPDATE analyses SET video_available = 0 WHERE user_id = ? AND id = ?", (str(user_id), str(session_id)))
+
 def mark_previous_videos_unavailable(user_id: str, keep_session_id: str | None = None) -> int:
     if not user_id:
         return 0

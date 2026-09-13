@@ -291,18 +291,7 @@ def get_yolo_detector():
     if _cached_detector is not None:
         return _cached_detector
 
-    # 1. Try Ultralytics YOLO loading vehicle_traffic.pt
-    if MODEL_PT.exists():
-        try:
-            from ultralytics import YOLO
-            model = YOLO(str(MODEL_PT))
-            print(f"[Detector] Loaded PyTorch UVH-26: {MODEL_PT}", flush=True)
-            _cached_detector = ("ultralytics", model)
-            return _cached_detector
-        except Exception as e:
-            print(f"[Detector] Ultralytics load skipped ({e})", flush=True)
-
-    # 2. Try ONNX Runtime loading vehicle_traffic.onnx
+    # 1. Primary: ONNX Runtime loading vehicle_traffic.onnx
     if MODEL_ONNX.exists():
         try:
             import onnxruntime as ort
@@ -311,7 +300,18 @@ def get_yolo_detector():
             _cached_detector = ("onnx", sess)
             return _cached_detector
         except Exception as e:
-            print(f"[Detector] ONNX load skipped ({e})", flush=True)
+            print(f"[Detector] ONNX load error ({e})", flush=True)
+
+    # 2. Fallback: PyTorch UVH-26 if available locally
+    if MODEL_PT.exists():
+        try:
+            from ultralytics import YOLO
+            model = YOLO(str(MODEL_PT))
+            print(f"[Detector] Loaded PyTorch UVH-26: {MODEL_PT}", flush=True)
+            _cached_detector = ("ultralytics", model)
+            return _cached_detector
+        except Exception as e:
+            pass
 
     return None
 

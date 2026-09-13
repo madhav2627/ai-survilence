@@ -1,105 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/index.py": {
+    "app.py": {
       "maxDuration": 60,
       "memory": 1024
     }
   },
-  "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": "/api/index.py"
-    },
-    {
-      "source": "/health",
-      "destination": "/api/index.py"
-    },
-    {
-      "source": "/",
-      "destination": "/frontend/index.html"
-    },
-    {
-      "source": "/login",
-      "destination": "/frontend/login.html"
-    },
-    {
-      "source": "/login.html",
-      "destination": "/frontend/login.html"
-    },
-    {
-      "source": "/register",
-      "destination": "/frontend/register.html"
-    },
-    {
-      "source": "/register.html",
-      "destination": "/frontend/register.html"
-    },
-    {
-      "source": "/css/(.*)",
-      "destination": "/frontend/css/$1"
-    },
-    {
-      "source": "/js/(.*)",
-      "destination": "/frontend/js/$1"
-    },
-    {
-      "source": "/assets/(.*)",
-      "destination": "/frontend/assets/$1"
-    },
-    {
-      "source": "/pages/(.*)",
-      "destination": "/frontend/pages/$1"
-    },
-    {
-      "source": "/dashboard",
-      "destination": "/frontend/pages/dashboard.html"
-    },
-    {
-      "source": "/surveillance",
-      "destination": "/frontend/pages/surveillance.html"
-    },
-    {
-      "source": "/cameras",
-      "destination": "/frontend/pages/cameras.html"
-    },
-    {
-      "source": "/live",
-      "destination": "/frontend/pages/live.html"
-    },
-    {
-      "source": "/analytics",
-      "destination": "/frontend/pages/analytics.html"
-    },
-    {
-      "source": "/traffic-ai",
-      "destination": "/frontend/pages/traffic-ai.html"
-    },
-    {
-      "source": "/history",
-      "destination": "/frontend/pages/history.html"
-    },
-    {
-      "source": "/reports",
-      "destination": "/frontend/pages/reports.html"
-    },
-    {
-      "source": "/settings",
-      "destination": "/frontend/pages/settings.html"
-    },
-    {
-      "source": "/background.png",
-      "destination": "/frontend/background.png"
-    },
-    {
-      "source": "/right_side.png",
-      "destination": "/frontend/right_side.png"
-    },
-    {
-      "source": "/(.*)",
-      "destination": "/api/index.py"
-    }
-  ],
   "headers": [
     {
       "source": "/:path*",
@@ -117,6 +23,12 @@
           "value": "1; mode=block"
         }
       ]
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/app.py"
     }
   ]
 }
