@@ -96,8 +96,11 @@ const ApiClient = {
         body: JSON.stringify({ filename: file.name, filesize: file.size }),
       });
     } catch (tokenErr) {
-      // If Blob is not configured (503) fall back to the legacy FormData upload.
-      if (tokenErr.status === 503) {
+      // If Blob is not configured (503) and file is under 4.5MB, fall back to legacy FormData upload.
+      if (tokenErr.status === 503 || (tokenErr.message && tokenErr.message.includes('not configured'))) {
+        if (file.size > 4.5 * 1024 * 1024) {
+          throw new Error('Videos larger than 4.5 MB require cloud storage. Please check server Blob configuration.');
+        }
         return ApiClient._analyzeLegacy(file);
       }
       throw tokenErr;
@@ -111,12 +114,13 @@ const ApiClient = {
 
     // ── Step 2: PUT file directly to Vercel Blob CDN ─────────────────────
     // Uses XMLHttpRequest so we get real upload progress events.
-    await new Promise((resolve, reject) => {
+    const blobResponseText = await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', uploadUrl, true);
-      // Vercel Blob client-upload requires the client token in the Authorization header
+      // Vercel Blob client-upload requires client token and access header
       xhr.setRequestHeader('Authorization', `Bearer ${clientToken}`);
       xhr.setRequestHeader('x-api-version', '7');
+      xhr.setRequestHeader('x-vercel-blob-access', tokenResp.access || 'private');
       xhr.setRequestHeader('Content-Type', file.type || 'video/mp4');
 
       xhr.upload.addEventListener('progress', (e) => {
@@ -129,7 +133,12 @@ const ApiClient = {
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve(xhr.responseText);
         } else {
-          reject(new Error(`Blob upload failed (HTTP ${xhr.status}): ${xhr.responseText.slice(0, 200)}`));
+          let errText = xhr.responseText.slice(0, 300);
+          try {
+            const errObj = JSON.parse(xhr.responseText);
+            if (errObj.error && errObj.error.message) errText = errObj.error.message;
+          } catch {}
+          reject(new Error(`Blob upload failed (HTTP ${xhr.status}): ${errText}`));
         }
       });
 
@@ -139,8 +148,15 @@ const ApiClient = {
       xhr.send(file);
     });
 
-    // Blob URL is the upload URL without query parameters
-    const blobUrl = uploadUrl.split('?')[0];
+    // Extract storage URL from Blob upload response
+    let blobUrl = '';
+    try {
+      const parsed = JSON.parse(blobResponseText);
+      blobUrl = parsed.url || parsed.downloadUrl || '';
+    } catch {}
+    if (!blobUrl) {
+      blobUrl = uploadUrl.split('?')[0];
+    }
 
     // ── Step 3: Tell Flask to download the blob and start AI processing ───
     return ApiClient._json('/api/analyze', {

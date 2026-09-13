@@ -209,11 +209,16 @@
 <script src="/js/api-client.js"></script>
 <script src="/js/shell.js"></script>
 <script>
-if (!Auth.requireAuth()) throw new Error('Not authenticated');
-document.addEventListener('DOMContentLoaded', () => {
+function bootSurveillance() {
+  if (!Auth.requireAuth()) return;
   renderShell('Surveillance');
   initSurveillance();
-});
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootSurveillance);
+} else {
+  bootSurveillance();
+}
 
 let currentFile = null;
 let currentSessionId = null;
@@ -304,6 +309,9 @@ function clearSelection() {
 async function startAnalysis() {
   if (!currentFile) { Toast.warning('No file selected', 'Please select a video file first.'); return; }
 
+  const startBtn = document.getElementById('start-analysis');
+  if (startBtn) startBtn.disabled = true;
+
   // Check if already processing
   try {
     const activeRes = await ApiClient.getActiveJob();
@@ -336,8 +344,13 @@ async function startAnalysis() {
     document.getElementById('session-badge').textContent = currentSessionId;
     appendTerminalLine(`[Server] Job created: ${res.jobId || currentSessionId}`);
     appendTerminalLine(`[AI Engine] Initializing UVH-26 YOLOv11-S vehicle detection...`);
-    pollJobProgress(currentSessionId);
+    if (res.status === 'completed') {
+      fetchResult(currentSessionId);
+    } else {
+      pollJobProgress(currentSessionId);
+    }
   } catch (err) {
+    if (startBtn) startBtn.disabled = false;
     if (err.message && err.message.includes('already in progress')) {
       Toast.warning('Already Processing', err.message);
       resetToUpload();
@@ -569,6 +582,12 @@ function showError(msg) {
 
 function cancelAnalysis() {
   if (progressSource) progressSource.close();
+  if (_pollTimer) clearInterval(_pollTimer);
+  ApiClient.getActiveJob().then(res => {
+    if (res && res.job && res.job.jobId) {
+      ApiClient._json(`/api/job/${res.job.jobId}/cancel`, { method: 'POST' }).catch(() => {});
+    }
+  }).catch(() => {});
   resetToUpload();
   Toast.info('Cancelled', 'Analysis was cancelled.');
 }
@@ -703,6 +722,8 @@ function resetToUpload() {
   document.getElementById('file-preview').style.display = 'none';
   document.getElementById('video-input').value = '';
   document.getElementById('session-badge').textContent = '';
+  const startBtn = document.getElementById('start-analysis');
+  if (startBtn) startBtn.disabled = false;
 }
 
 async function loadExistingSession(sessionId) {

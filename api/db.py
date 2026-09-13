@@ -16,6 +16,7 @@ import uuid
 import hashlib
 import sqlite3
 import threading
+import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -516,6 +517,20 @@ def get_active_job(user_id: str) -> dict | None:
     )
     if not row:
         return None
+
+    # Auto-expire jobs stuck in processing for more than 10 minutes (600s)
+    created_at_str = row.get("created_at", "")
+    try:
+        if created_at_str:
+            created_dt = datetime.datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            age_seconds = (datetime.datetime.now(datetime.timezone.utc) - created_dt).total_seconds()
+            if age_seconds > 600:
+                print(f"[DB] Auto-expiring stale active job {row['id']} (age: {age_seconds:.0f}s)", flush=True)
+                complete_job(row["id"], status="failed", error="Job timed out")
+                return None
+    except Exception as e:
+        print(f"[DB] Error checking job age: {e}", flush=True)
+
     return {
         "jobId": row["id"],
         "sessionId": row.get("analysis_id"),

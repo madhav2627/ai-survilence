@@ -20,6 +20,8 @@ import queue
 import shutil
 import hashlib
 import hmac
+import base64
+import urllib.parse
 import threading
 from pathlib import Path
 
@@ -30,7 +32,10 @@ from flask_cors import CORS
 # ── Vercel Blob configuration ────────────────────────────────────────────────
 # Set BLOB_READ_WRITE_TOKEN in Vercel Dashboard → Project → Environment Variables.
 # The token is NEVER sent to the browser.  Only the server uses it.
-BLOB_READ_WRITE_TOKEN: str = os.environ.get("BLOB_READ_WRITE_TOKEN", "")
+BLOB_READ_WRITE_TOKEN: str = os.environ.get(
+    "BLOB_READ_WRITE_TOKEN",
+    "vercel_blob_rw_SRlaRmWvR3ct3PuP_fMy1EWnffJIO1qI0zDuhP3G9sDbQsi"
+)
 # Maximum video size we allow through Blob (2 GB)
 MAX_BLOB_VIDEO_BYTES: int = 2 * 1024 * 1024 * 1024
 # Vercel Blob API root
@@ -369,64 +374,64 @@ def _blob_available() -> bool:
     return bool(BLOB_READ_WRITE_TOKEN)
 
 
-def _generate_client_token(pathname: str, valid_for_seconds: int = 300) -> dict | None:
-    """Ask the Vercel Blob REST API to issue a short-lived client upload token.
+def _generate_client_token(pathname: str, valid_for_seconds: int = 600) -> dict | None:
+    """Generate a scoped, short-lived client upload token using HMAC-SHA256.
 
-    The full BLOB_READ_WRITE_TOKEN is used here (server-side only) to generate
-    a scoped, short-lived client token that the browser can use to PUT directly
-    to Vercel Blob.  The secret token is NEVER returned to the browser.
-
-    Returns a dict with at least:
-      { "url": str, "clientToken": str }
-    or None on failure.
+    The secret BLOB_READ_WRITE_TOKEN is kept strictly server-side.
+    Returns the direct upload URL and clientToken for the browser to PUT.
     """
-    if not BLOB_READ_WRITE_TOKEN:
+    token = os.environ.get("BLOB_READ_WRITE_TOKEN", "") or BLOB_READ_WRITE_TOKEN
+    if not token:
         return None
     try:
-        # Vercel Blob "generate client token" endpoint
-        resp = _requests.post(
-            f"{_BLOB_API}/",
-            params={
-                "action": "upload",
-                "pathname": pathname,
-                "validFor": str(valid_for_seconds),
-                "multipart": "false",
-                "contentDisposition": "inline",
-                "access": "public",  # blobs are addressable by URL for backend download
-            },
-            headers={
-                "Authorization": f"Bearer {BLOB_READ_WRITE_TOKEN}",
-                "x-api-version": "7",
-            },
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            print(f"[Blob] generate-token error {resp.status_code}: {resp.text[:300]}", flush=True)
+        parts = token.split("_")
+        if len(parts) < 4:
             return None
-        return resp.json()
+        store_id = parts[3]
+
+        valid_until = int((time.time() + valid_for_seconds) * 1000)
+        payload_dict = {
+            "pathname": pathname,
+            "validUntil": valid_until,
+        }
+        payload_json = json.dumps(payload_dict, separators=(",", ":"))
+        payload_b64 = base64.b64encode(payload_json.encode("utf-8")).decode("utf-8")
+
+        # HMAC with rw_token as secret key
+        h = hmac.new(token.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256)
+        secured_key = h.hexdigest()
+
+        combined = f"{secured_key}.{payload_b64}"
+        combined_b64 = base64.b64encode(combined.encode("utf-8")).decode("utf-8")
+        client_token = f"vercel_blob_client_{store_id}_{combined_b64}"
+
+        upload_url = f"https://blob.vercel-storage.com/{pathname}"
+        return {
+            "url": upload_url,
+            "clientToken": client_token,
+            "access": "private",
+        }
     except Exception as exc:
-        print(f"[Blob] generate-token exception: {exc}", flush=True)
+        print(f"[Blob] _generate_client_token error: {exc}", flush=True)
         return None
 
 
 def _delete_blob_object(blob_url: str) -> bool:
-    """Delete a single blob object by its public URL.  Best-effort, never raises."""
-    if not BLOB_READ_WRITE_TOKEN or not blob_url:
+    """Delete a single blob object by its URL. Best-effort, never raises."""
+    token = os.environ.get("BLOB_READ_WRITE_TOKEN", "") or BLOB_READ_WRITE_TOKEN
+    if not token or not blob_url:
         return False
     try:
-        resp = _requests.delete(
-            f"{_BLOB_API}/",
-            params={"url": blob_url},
+        resp = _requests.post(
+            f"{_BLOB_API}/delete",
+            json={"urls": [blob_url]},
             headers={
-                "Authorization": f"Bearer {BLOB_READ_WRITE_TOKEN}",
+                "Authorization": f"Bearer {token}",
                 "x-api-version": "7",
             },
             timeout=15,
         )
-        ok = resp.status_code in (200, 204)
-        if not ok:
-            print(f"[Blob] delete {blob_url[:80]} -> {resp.status_code}", flush=True)
-        return ok
+        return resp.status_code in (200, 204)
     except Exception as exc:
         print(f"[Blob] delete exception: {exc}", flush=True)
         return False
@@ -439,7 +444,7 @@ def _validate_blob_url_ownership(blob_url: str, user_id: str, session_id: str) -
     This prevents one user from pointing /api/analyze at another user's blob.
     """
     expected_fragment = f"traffic-users/{user_id}/{session_id}/"
-    return expected_fragment in blob_url
+    return expected_fragment in blob_url or expected_fragment in urllib.parse.unquote(blob_url)
 
 
 @app.route("/api/blob/upload-token", methods=["POST"])
@@ -495,6 +500,7 @@ def blob_upload_token():
         "url": token_data.get("url"),
         # clientToken: short-lived scoped token for browser PUT
         "clientToken": token_data.get("clientToken"),
+        "access": token_data.get("access", "private"),
     })
 
 
@@ -548,7 +554,11 @@ def analyze():
 
         try:
             print(f"[Blob] Downloading {blob_url[:80]}... to {input_path}", flush=True)
-            with _requests.get(blob_url, stream=True, timeout=120) as r:
+            headers = {}
+            token = os.environ.get("BLOB_READ_WRITE_TOKEN", "") or BLOB_READ_WRITE_TOKEN
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            with _requests.get(blob_url, headers=headers, stream=True, timeout=180) as r:
                 r.raise_for_status()
                 total = 0
                 with open(input_path, "wb") as fout:
@@ -578,13 +588,31 @@ def analyze():
             _active_threads[job["jobId"]] = t
         t.start()
 
+        # Keep serverless connection active for up to 45s so the detector runs with full CPU
+        t.join(timeout=45)
+
+        # Check if already completed
+        completed = db.get_recently_completed_job(user_id)
+        if completed and completed.get("sessionId") == session_id:
+            return jsonify({
+                "sessionId": session_id,
+                "session_id": session_id,
+                "jobId": job["jobId"],
+                "status": "completed",
+                "filename": orig_name,
+                "stage": "Analysis complete",
+                "userId": user_id,
+            })
+
+        active = db.get_active_job(user_id)
         return jsonify({
             "sessionId": session_id,
             "session_id": session_id,
             "jobId": job["jobId"],
             "status": "processing",
             "filename": orig_name,
-            "stage": "Blob received — starting AI analysis",
+            "stage": active.get("stage", "Detecting & tracking vehicles...") if active else "Processing...",
+            "progress": active.get("progress", 10) if active else 10,
             "userId": user_id,
         })
 
