@@ -18,11 +18,23 @@ import time
 import uuid
 import queue
 import shutil
+import hashlib
+import hmac
 import threading
 from pathlib import Path
 
+import requests as _requests
 from flask import Flask, request, jsonify, Response, send_file, send_from_directory, abort
 from flask_cors import CORS
+
+# ── Vercel Blob configuration ────────────────────────────────────────────────
+# Set BLOB_READ_WRITE_TOKEN in Vercel Dashboard → Project → Environment Variables.
+# The token is NEVER sent to the browser.  Only the server uses it.
+BLOB_READ_WRITE_TOKEN: str = os.environ.get("BLOB_READ_WRITE_TOKEN", "")
+# Maximum video size we allow through Blob (2 GB)
+MAX_BLOB_VIDEO_BYTES: int = 2 * 1024 * 1024 * 1024
+# Vercel Blob API root
+_BLOB_API = "https://blob.vercel-storage.com"
 
 # Setup Python paths
 ROOT_DIR = Path(__file__).resolve().parent
@@ -246,11 +258,21 @@ def _remove_previous_physical_videos(user_id: str, keep_session_id: str) -> int:
     db.mark_previous_videos_unavailable(user_id, keep_session_id)
     return removed
 
-def _run_detection_worker(user_id: str, job_id: str, session_id: str, input_path: str, output_path: str, report_path: str, orig_name: str):
+def _run_detection_worker(
+    user_id: str,
+    job_id: str,
+    session_id: str,
+    input_path: str,
+    output_path: str,
+    report_path: str,
+    orig_name: str,
+    input_blob_url: str = "",   # Vercel Blob URL of the uploaded input video (empty if legacy upload)
+):
     try:
         def on_progress(pct, stage):
             db.update_job_progress(job_id, pct, stage)
 
+        # ── Real IISc UVH-26 YOLOv11-S + ByteTrack inference ─────────────────
         report = process_video_analysis(
             input_path=input_path,
             output_video_path=output_path,
@@ -261,7 +283,7 @@ def _run_detection_worker(user_id: str, job_id: str, session_id: str, input_path
             max_dim=1280
         )
 
-        # Save to database
+        # Save analysis metadata and report to database
         analysis_data = {
             "sessionId": session_id,
             "filename": orig_name,
@@ -283,7 +305,7 @@ def _run_detection_worker(user_id: str, job_id: str, session_id: str, input_path
         db.save_report(user_id, session_id, report)
         db.complete_job(job_id, status="completed")
 
-        # Clean up older physical video files for this user (Max 1 physical video retained)
+        # ── Retention: delete older physical /tmp video files (keep newest only) ─
         entries = db.get_user_history(user_id)
         for e in entries:
             sid = e.get("sessionId")
@@ -295,6 +317,22 @@ def _run_detection_worker(user_id: str, job_id: str, session_id: str, input_path
                             Path(p).unlink()
                         except Exception:
                             pass
+
+        # ── Blob retention: delete old input blob objects from Vercel Blob ──────
+        # The input video on Vercel Blob storage is no longer needed after
+        # processing; the output video lives on /tmp and is served via Flask.
+        # Delete the just-processed input blob first (already copied to /tmp).
+        if input_blob_url:
+            _delete_blob_object(input_blob_url)
+            print(f"[Blob] Deleted input blob {input_blob_url[:80]}", flush=True)
+
+        # Also delete any older input blob URLs recorded in history.
+        for e in entries:
+            sid = e.get("sessionId")
+            if sid != session_id:
+                old_blob = e.get("input_blob_url", "")
+                if old_blob and old_blob != input_blob_url:
+                    _delete_blob_object(old_blob)
 
     except Exception as exc:
         print(f"[Detector Worker Error] {exc}", flush=True)
@@ -312,6 +350,144 @@ def _run_detection_worker(user_id: str, job_id: str, session_id: str, input_path
         with _threads_lock:
             _active_threads.pop(job_id, None)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# VERCEL BLOB — SECURE CLIENT UPLOAD HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _blob_available() -> bool:
+    """Return True when BLOB_READ_WRITE_TOKEN is configured."""
+    return bool(BLOB_READ_WRITE_TOKEN)
+
+
+def _generate_client_token(pathname: str, valid_for_seconds: int = 300) -> dict | None:
+    """Ask the Vercel Blob REST API to issue a short-lived client upload token.
+
+    The full BLOB_READ_WRITE_TOKEN is used here (server-side only) to generate
+    a scoped, short-lived client token that the browser can use to PUT directly
+    to Vercel Blob.  The secret token is NEVER returned to the browser.
+
+    Returns a dict with at least:
+      { "url": str, "clientToken": str }
+    or None on failure.
+    """
+    if not BLOB_READ_WRITE_TOKEN:
+        return None
+    try:
+        # Vercel Blob "generate client token" endpoint
+        resp = _requests.post(
+            f"{_BLOB_API}/",
+            params={
+                "action": "upload",
+                "pathname": pathname,
+                "validFor": str(valid_for_seconds),
+                "multipart": "false",
+                "contentDisposition": "inline",
+                "access": "public",  # blobs are addressable by URL for backend download
+            },
+            headers={
+                "Authorization": f"Bearer {BLOB_READ_WRITE_TOKEN}",
+                "x-api-version": "7",
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"[Blob] generate-token error {resp.status_code}: {resp.text[:300]}", flush=True)
+            return None
+        return resp.json()
+    except Exception as exc:
+        print(f"[Blob] generate-token exception: {exc}", flush=True)
+        return None
+
+
+def _delete_blob_object(blob_url: str) -> bool:
+    """Delete a single blob object by its public URL.  Best-effort, never raises."""
+    if not BLOB_READ_WRITE_TOKEN or not blob_url:
+        return False
+    try:
+        resp = _requests.delete(
+            f"{_BLOB_API}/",
+            params={"url": blob_url},
+            headers={
+                "Authorization": f"Bearer {BLOB_READ_WRITE_TOKEN}",
+                "x-api-version": "7",
+            },
+            timeout=15,
+        )
+        ok = resp.status_code in (200, 204)
+        if not ok:
+            print(f"[Blob] delete {blob_url[:80]} -> {resp.status_code}", flush=True)
+        return ok
+    except Exception as exc:
+        print(f"[Blob] delete exception: {exc}", flush=True)
+        return False
+
+
+def _validate_blob_url_ownership(blob_url: str, user_id: str, session_id: str) -> bool:
+    """Ensure the blob URL contains the expected user/session path prefix.
+
+    Pattern enforced: traffic-users/<user_id>/<session_id>/
+    This prevents one user from pointing /api/analyze at another user's blob.
+    """
+    expected_fragment = f"traffic-users/{user_id}/{session_id}/"
+    return expected_fragment in blob_url
+
+
+@app.route("/api/blob/upload-token", methods=["POST"])
+def blob_upload_token():
+    """Return a short-lived Vercel Blob client upload token for direct browser upload.
+
+    The browser obtains this token, uses it to PUT the video directly to
+    Vercel Blob CDN, then sends only the returned blob_url to /api/analyze.
+    The BLOB_READ_WRITE_TOKEN secret is never exposed to the browser.
+    """
+    user_id = get_current_user_id()
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if not _blob_available():
+        return jsonify({
+            "error": "Vercel Blob is not configured. Set BLOB_READ_WRITE_TOKEN environment variable.",
+            "code": "BLOB_NOT_CONFIGURED",
+        }), 503
+
+    data = request.get_json(silent=True) or {}
+    filename = data.get("filename", "")
+    filesize = int(data.get("filesize", 0))
+
+    if not filename:
+        return jsonify({"error": "filename is required"}), 400
+
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({"error": f"Unsupported format '{ext}'. Allowed: MP4, AVI, MOV, MKV, WebM"}), 400
+
+    if filesize > MAX_BLOB_VIDEO_BYTES:
+        return jsonify({"error": "File exceeds maximum allowed size (2 GB)"}), 400
+
+    # Generate a unique, user-scoped session ID and blob pathname
+    session_id = f"sess_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    safe_name = safe_filename(filename)
+    # Path format: traffic-users/<user_id>/<session_id>/<safe_filename>
+    pathname = f"traffic-users/{user_id}/{session_id}/{safe_name}"
+
+    token_data = _generate_client_token(pathname, valid_for_seconds=600)
+    if not token_data:
+        return jsonify({"error": "Failed to generate Blob upload token. Please try again."}), 500
+
+    # Return ONLY what the browser needs — never the master BLOB_READ_WRITE_TOKEN
+    return jsonify({
+        "ok": True,
+        "session_id": session_id,
+        "sessionId": session_id,
+        "pathname": pathname,
+        "filename": safe_name,
+        # url: where browser should PUT the file
+        "url": token_data.get("url"),
+        # clientToken: short-lived scoped token for browser PUT
+        "clientToken": token_data.get("clientToken"),
+    })
+
+
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
     user_id = get_current_user_id()
@@ -327,8 +503,87 @@ def analyze():
             "activeJob": existing_job,
         }), 409
 
+    # ── Path A: New Vercel Blob flow (JSON body with blob_url) ───────────────
+    # The browser uploads the video directly to Vercel Blob and sends only
+    # lightweight metadata here.  Video bytes never pass through this function.
+    json_body = request.get_json(silent=True)
+    if json_body and json_body.get("blob_url"):
+        blob_url: str = json_body["blob_url"]
+        filename: str = json_body.get("filename", "video.mp4")
+        session_id: str = json_body.get("session_id") or json_body.get("sessionId") or ""
+        client_user_id: str = json_body.get("user_id", user_id)
+
+        # Security: reject if client tries to use a different user's session
+        if client_user_id != user_id:
+            return jsonify({"error": "user_id mismatch"}), 403
+
+        # Validate session_id format (must look like sess_<digits>_<hex>)
+        if not session_id or not session_id.startswith("sess_"):
+            return jsonify({"error": "Invalid or missing session_id"}), 400
+
+        # Validate blob URL ownership — must contain traffic-users/<user_id>/<session_id>/
+        if not _validate_blob_url_ownership(blob_url, user_id, session_id):
+            return jsonify({"error": "Blob URL does not match your user/session"}), 403
+
+        # Validate file extension
+        orig_name = safe_filename(filename)
+        ext = Path(orig_name).suffix.lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            return jsonify({"error": f"Unsupported format '{ext}'"}), 400
+
+        # Download blob from Vercel CDN to /tmp
+        input_path = str(UPLOAD_DIR / f"{session_id}_{orig_name}")
+        output_path = str(RESULTS_DIR / f"{session_id}_output.mp4")
+        report_path = str(REPORTS_DIR / f"{session_id}_report.json")
+
+        try:
+            print(f"[Blob] Downloading {blob_url[:80]}... to {input_path}", flush=True)
+            with _requests.get(blob_url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                total = 0
+                with open(input_path, "wb") as fout:
+                    for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                        if chunk:
+                            fout.write(chunk)
+                            total += len(chunk)
+            print(f"[Blob] Downloaded {total / 1_048_576:.1f} MB", flush=True)
+        except Exception as exc:
+            return jsonify({"error": f"Failed to retrieve uploaded video from Blob: {exc}"}), 500
+
+        if not Path(input_path).exists() or Path(input_path).stat().st_size == 0:
+            return jsonify({"error": "Downloaded video is empty or missing"}), 400
+
+        # Retention: remove older physical videos for this user
+        removed_previous = _remove_previous_physical_videos(user_id, session_id)
+        print(f"[Storage] New session {session_id}: removed {removed_previous} previous physical file(s)", flush=True)
+
+        job = db.create_job(user_id, session_id, orig_name)
+
+        t = threading.Thread(
+            target=_run_detection_worker,
+            args=(user_id, job["jobId"], session_id, input_path, output_path, report_path, orig_name, blob_url),
+            daemon=True,
+        )
+        with _threads_lock:
+            _active_threads[job["jobId"]] = t
+        t.start()
+
+        return jsonify({
+            "sessionId": session_id,
+            "session_id": session_id,
+            "jobId": job["jobId"],
+            "status": "processing",
+            "filename": orig_name,
+            "stage": "Blob received — starting AI analysis",
+            "userId": user_id,
+        })
+
+    # ── Path B: Legacy multipart file upload (local dev / fallback) ──────────
+    # This path allows the existing FormData upload to continue working locally.
+    # On Vercel, videos >4.5 MB will still hit 413 on this path — that is
+    # expected; the browser should always use the Blob path in production.
     if "video" not in request.files:
-        return jsonify({"error": "No video file provided"}), 400
+        return jsonify({"error": "No video file provided. Use /api/blob/upload-token for large files."}), 400
 
     f = request.files["video"]
     if not f.filename:
@@ -353,16 +608,11 @@ def analyze():
     if not Path(input_path).exists() or Path(input_path).stat().st_size == 0:
         return jsonify({"error": "Uploaded video file is empty or missing"}), 400
 
-    # Retention rule: once a new video is successfully uploaded, immediately
-    # remove older physical input/output videos for this user. History and
-    # analysis reports remain permanent.
     removed_previous = _remove_previous_physical_videos(user_id, session_id)
     print(f"[Storage] New session {session_id}: removed {removed_previous} previous physical video file(s)", flush=True)
 
-    # Create server-side processing job
     job = db.create_job(user_id, session_id, orig_name)
 
-    # Launch processing in background thread
     t = threading.Thread(
         target=_run_detection_worker,
         args=(user_id, job["jobId"], session_id, input_path, output_path, report_path, orig_name),

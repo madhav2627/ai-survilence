@@ -318,10 +318,20 @@ async function startAnalysis() {
   } catch {}
 
   showProcessing(currentFile.name);
-  appendTerminalLine('[Client] Uploading video to cloud server...');
+  appendTerminalLine('[Client] Requesting secure Blob upload token...');
+
+  // Progress callback — drives the existing progress bar during upload phase
+  function onUploadProgress(pct) {
+    const bar = document.getElementById('proc-progress');
+    if (bar) bar.style.width = `${Math.min(pct, 99)}%`;
+    updateProcTitle(`Uploading video to cloud storage... ${pct}%`);
+    if (pct === 100) {
+      appendTerminalLine('[Client] Upload complete. Starting AI analysis...');
+    }
+  }
 
   try {
-    const res = await ApiClient.analyze(currentFile);
+    const res = await ApiClient.analyze(currentFile, onUploadProgress);
     currentSessionId = res.sessionId || res.session_id;
     document.getElementById('session-badge').textContent = currentSessionId;
     appendTerminalLine(`[Server] Job created: ${res.jobId || currentSessionId}`);

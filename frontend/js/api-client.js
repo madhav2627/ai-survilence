@@ -71,15 +71,99 @@ const ApiClient = {
   /* ── Analysis ─────────────────────────────────────────────── */
   /**
    * Upload a video file and start server-side AI processing.
-   * Throws with code ALREADY_PROCESSING if user already has an active job.
+   *
+   * New flow (Vercel Blob):
+   *   1. POST /api/blob/upload-token  → { url, clientToken, session_id, filename }
+   *   2. PUT <url> with raw file bytes via XHR (supports real progress via onProgress)
+   *   3. POST /api/analyze with JSON { blob_url, filename, session_id, user_id }
+   *
+   * Legacy fallback (local dev / Blob not configured):
+   *   POST /api/analyze with FormData (videos > 4.5 MB will still 413 on Vercel)
+   *
+   * @param {File} file - The video File object selected by the user.
+   * @param {function(number):void} [onProgress] - Called with 0-100 during Blob upload.
+   * @throws with code ALREADY_PROCESSING if user already has an active job.
    */
-  async analyze(file) {
+  async analyze(file, onProgress) {
+    const uid = (typeof Auth !== 'undefined' && Auth.getUserId) ? Auth.getUserId() : null;
+
+    // ── Step 1: Request an upload token from Flask ────────────────────────
+    let tokenResp;
+    try {
+      tokenResp = await ApiClient._json('/api/blob/upload-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, filesize: file.size }),
+      });
+    } catch (tokenErr) {
+      // If Blob is not configured (503) fall back to the legacy FormData upload.
+      if (tokenErr.status === 503) {
+        return ApiClient._analyzeLegacy(file);
+      }
+      throw tokenErr;
+    }
+
+    if (!tokenResp.ok || !tokenResp.url || !tokenResp.clientToken) {
+      throw new Error(tokenResp.error || 'Failed to obtain Blob upload token');
+    }
+
+    const { url: uploadUrl, clientToken, session_id: sessionId, filename: safeFilename } = tokenResp;
+
+    // ── Step 2: PUT file directly to Vercel Blob CDN ─────────────────────
+    // Uses XMLHttpRequest so we get real upload progress events.
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', uploadUrl, true);
+      // Vercel Blob client-upload requires the client token in the Authorization header
+      xhr.setRequestHeader('Authorization', `Bearer ${clientToken}`);
+      xhr.setRequestHeader('x-api-version', '7');
+      xhr.setRequestHeader('Content-Type', file.type || 'video/mp4');
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable && typeof onProgress === 'function') {
+          onProgress(Math.round((e.loaded / e.total) * 100));
+        }
+      });
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(xhr.responseText);
+        } else {
+          reject(new Error(`Blob upload failed (HTTP ${xhr.status}): ${xhr.responseText.slice(0, 200)}`));
+        }
+      });
+
+      xhr.addEventListener('error', () => reject(new Error('Network error during Blob upload')));
+      xhr.addEventListener('abort', () => reject(new Error('Blob upload was aborted')));
+
+      xhr.send(file);
+    });
+
+    // Blob URL is the upload URL without query parameters
+    const blobUrl = uploadUrl.split('?')[0];
+
+    // ── Step 3: Tell Flask to download the blob and start AI processing ───
+    return ApiClient._json('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        blob_url: blobUrl,
+        filename: safeFilename || file.name,
+        session_id: sessionId,
+        user_id: uid,
+      }),
+    });
+  },
+
+  /** Legacy FormData upload — for local dev or when Blob is not configured. */
+  async _analyzeLegacy(file) {
     const form = new FormData();
     form.append('video', file);
     const uid = (typeof Auth !== 'undefined' && Auth.getUserId) ? Auth.getUserId() : null;
     if (uid) form.append('user_id', uid);
     return ApiClient._json('/api/analyze', { method: 'POST', body: form });
   },
+
 
   /**
    * Fetch any currently active processing job for this user.
