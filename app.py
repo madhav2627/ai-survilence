@@ -622,8 +622,8 @@ def analyze():
             _active_threads[job["jobId"]] = t
         t.start()
 
-        # Keep serverless connection active for up to 45s so the detector runs with full CPU
-        t.join(timeout=45)
+        # Allow thread to start and verify initialization without risking 504 timeout
+        t.join(timeout=2.0)
 
         # Check if already completed
         completed = db.get_recently_completed_job(user_id)
@@ -708,8 +708,14 @@ def analyze():
 def active_job():
     user_id = get_current_user_id()
     if not user_id:
-        return jsonify({"job": None})
+        return jsonify({"job": None, "active": False})
     job = db.get_active_job(user_id)
+    if job and job.get("jobId"):
+        with _threads_lock:
+            t = _active_threads.get(job["jobId"])
+        if t and t.is_alive():
+            t.join(timeout=1.5)
+            job = db.get_active_job(user_id) or job
     return jsonify({"job": job, "active": bool(job)})
 
 @app.route("/api/completed-job")
