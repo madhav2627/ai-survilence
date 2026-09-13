@@ -1,24 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "version": 2,
-  "cleanUrls": true,
-  "trailingSlash": false,
   "functions": {
-    "api/index.py": {
+    "app.py": {
       "maxDuration": 60,
       "memory": 1024
     }
   },
-  "rewrites": [
-    {
-      "source": "/health",
-      "destination": "/api/index.py"
-    },
-    {
-      "source": "/api/:path*",
-      "destination": "/api/index.py"
-    }
-  ],
   "headers": [
     {
       "source": "/:path*",
