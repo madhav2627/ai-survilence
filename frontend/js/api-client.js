@@ -84,7 +84,7 @@ const ApiClient = {
    * @param {function(number):void} [onProgress] - Called with 0-100 during Blob upload.
    * @throws with code ALREADY_PROCESSING if user already has an active job.
    */
-  async analyze(file, onProgress) {
+  async analyze(file, onProgress, onSessionCreated) {
     const uid = (typeof Auth !== 'undefined' && Auth.getUserId) ? Auth.getUserId() : null;
 
     // ── Step 1: Request an upload token from Flask ────────────────────────
@@ -111,6 +111,9 @@ const ApiClient = {
     }
 
     const { url: uploadUrl, clientToken, session_id: sessionId, filename: safeFilename } = tokenResp;
+    if (typeof onSessionCreated === 'function') {
+      try { onSessionCreated(sessionId); } catch {}
+    }
 
     // ── Step 2: PUT file directly to Vercel Blob CDN ─────────────────────
     // Uses XMLHttpRequest so we get real upload progress events.

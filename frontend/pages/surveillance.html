@@ -336,6 +336,12 @@ async function startAnalysis() {
   showProcessing(currentFile.name);
   appendTerminalLine('[Client] Requesting secure Blob upload token...');
 
+  function onSessionCreated(sessionId) {
+    currentSessionId = sessionId;
+    const badge = document.getElementById('session-badge');
+    if (badge) badge.textContent = sessionId;
+  }
+
   // Progress callback — drives the existing progress bar during upload phase
   function onUploadProgress(pct) {
     const bar = document.getElementById('proc-progress');
@@ -343,17 +349,27 @@ async function startAnalysis() {
     updateProcTitle(`Uploading video to cloud storage... ${pct}%`);
     if (pct === 100) {
       appendTerminalLine('[Client] Upload complete. Starting AI analysis...');
+      appendTerminalLine(`[AI Engine] Initializing UVH-26 YOLOv11-S vehicle detection...`);
+      if (currentSessionId) {
+        pollJobProgress(currentSessionId);
+      }
     }
   }
 
   try {
-    const res = await ApiClient.analyze(currentFile, onUploadProgress);
-    currentSessionId = res.sessionId || res.session_id;
+    const res = await ApiClient.analyze(currentFile, onUploadProgress, onSessionCreated);
+    currentSessionId = res.sessionId || res.session_id || currentSessionId;
     document.getElementById('session-badge').textContent = currentSessionId;
-    appendTerminalLine(`[Server] Job created: ${res.jobId || currentSessionId}`);
-    appendTerminalLine(`[AI Engine] Initializing UVH-26 YOLOv11-S vehicle detection...`);
     if (res.status === 'completed') {
-      fetchResult(currentSessionId);
+      if (_pollTimer) clearInterval(_pollTimer);
+      if (res.report) {
+        updateProcProgress(100, 'Analysis complete!');
+        currentReport = res.report;
+        showResults(currentSessionId, res.report, true);
+        Toast.success('Analysis complete', 'Vehicle detection finished successfully.');
+      } else {
+        fetchResult(currentSessionId);
+      }
     } else {
       pollJobProgress(currentSessionId);
     }

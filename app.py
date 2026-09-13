@@ -272,10 +272,10 @@ def _cleanup_tmp_storage(ttl_seconds: int = 3600):
             pass
 
 def _remove_previous_physical_videos(user_id: str, keep_session_id: str) -> int:
-    """Delete retained physical input/output videos from older analyses.
+    """Delete retained physical input/output videos and blobs from older analyses.
 
     Analysis history and reports are deliberately preserved; only the physical
-    video files are removed. The newest uploaded session is never touched.
+    video files and temporary blobs are removed. The newest uploaded session is never touched.
     """
     removed = 0
     entries = db.get_user_history(user_id)
@@ -286,13 +286,20 @@ def _remove_previous_physical_videos(user_id: str, keep_session_id: str) -> int:
             raw_path = entry.get(key)
             if not raw_path:
                 continue
-            path = Path(raw_path)
-            try:
-                if path.exists() and path.is_file():
-                    path.unlink()
-                    removed += 1
-            except Exception as exc:
-                print(f"[Storage] Could not delete previous {key}: {path} ({exc})", flush=True)
+            if raw_path.startswith("http"):
+                try:
+                    if _delete_blob_object(raw_path):
+                        removed += 1
+                except Exception as exc:
+                    print(f"[Storage] Could not delete previous blob {raw_path}: {exc}", flush=True)
+            else:
+                path = Path(raw_path)
+                try:
+                    if path.exists() and path.is_file():
+                        path.unlink()
+                        removed += 1
+                except Exception as exc:
+                    print(f"[Storage] Could not delete previous {key}: {path} ({exc})", flush=True)
 
     # Keep history rows but mark older physical videos as unavailable.
     db.mark_previous_videos_unavailable(user_id, keep_session_id)
@@ -307,7 +314,7 @@ def _run_detection_worker(
     report_path: str,
     orig_name: str,
     input_blob_url: str = "",   # Vercel Blob URL of the uploaded input video (empty if legacy upload)
-):
+) -> dict:
     try:
         def on_progress(pct, stage):
             db.update_job_progress(job_id, pct, stage)
@@ -339,6 +346,23 @@ def _run_detection_worker(
         t_cleanup = time.time() - t_clean_0
         print(f"[PERF] Cleanup: {t_cleanup:.3f}s", flush=True)
 
+        # ── Upload processed output video to Vercel Blob for cross-instance durability ──
+        final_video_target = output_path
+        if _blob_available() and Path(output_path).exists() and Path(output_path).stat().st_size > 0:
+            out_blob_pathname = f"traffic-users/{user_id}/{session_id}/tracked_{session_id}.mp4"
+            print(f"[Blob] Uploading processed video to Vercel Blob: {out_blob_pathname}", flush=True)
+            t_up0 = time.time()
+            out_blob_url = _upload_to_blob(output_path, out_blob_pathname, content_type="video/mp4")
+            if out_blob_url:
+                final_video_target = out_blob_url
+                print(f"[Blob] Output video uploaded successfully ({time.time() - t_up0:.2f}s): {out_blob_url[:80]}", flush=True)
+                # Remove local file from /tmp to keep serverless disk clean
+                try:
+                    Path(output_path).unlink()
+                    print(f"[Storage] Cleaned temporary output video from /tmp: {output_path}", flush=True)
+                except Exception:
+                    pass
+
         # Save analysis metadata and report to database
         analysis_data = {
             "sessionId": session_id,
@@ -354,7 +378,7 @@ def _run_detection_worker(
             "video_duration": report.get("video_duration", 0),
             "processing_time": report.get("processing_time_seconds", 0),
             "input_video": "",
-            "output_video": output_path,
+            "output_video": final_video_target,
             "report_path": report_path,
             "video_available": 1,
         }
@@ -362,21 +386,10 @@ def _run_detection_worker(
         db.save_report(user_id, session_id, report)
         db.complete_job(job_id, status="completed")
 
-        # ── Retention: delete older physical /tmp video files for this user ───
-        entries = db.get_user_history(user_id)
-        for e in entries:
-            sid = e.get("sessionId")
-            if sid != session_id:
-                for k in ("input_video", "output_video"):
-                    p = e.get(k)
-                    if p and Path(p).exists() and str(p) != output_path and str(p) != input_path:
-                        try:
-                            Path(p).unlink()
-                        except Exception:
-                            pass
-                old_blob = e.get("input_blob_url", "")
-                if old_blob and old_blob != input_blob_url:
-                    _delete_blob_object(old_blob)
+        # ── Retention: delete older physical video files and blobs for this user ───
+        _remove_previous_physical_videos(user_id, keep_session_id=session_id)
+
+        return report
 
     except Exception as exc:
         print(f"[Detector Worker Error] {exc}", flush=True)
@@ -400,6 +413,7 @@ def _run_detection_worker(
             "report_path": "",
             "video_available": 0,
         })
+        raise
     finally:
         with _threads_lock:
             _active_threads.pop(job_id, None)
@@ -474,6 +488,66 @@ def _delete_blob_object(blob_url: str) -> bool:
     except Exception as exc:
         print(f"[Blob] delete exception: {exc}", flush=True)
         return False
+
+
+def _upload_to_blob(file_path: str, pathname: str, content_type: str = "video/mp4") -> str | None:
+    """Upload a file to private Vercel Blob storage using the server's BLOB_READ_WRITE_TOKEN."""
+    token = os.environ.get("BLOB_READ_WRITE_TOKEN", "") or BLOB_READ_WRITE_TOKEN
+    if not token or not Path(file_path).exists():
+        return None
+    try:
+        with open(file_path, "rb") as f:
+            resp = _requests.put(
+                f"{_BLOB_API}/{pathname}",
+                data=f,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "x-api-version": "7",
+                    "x-vercel-blob-access": "private",
+                    "Content-Type": content_type,
+                },
+                timeout=180,
+            )
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return data.get("url") or data.get("downloadUrl")
+        else:
+            print(f"[Blob] Upload returned {resp.status_code}: {resp.text[:200]}", flush=True)
+    except Exception as exc:
+        print(f"[Blob] Upload failed: {exc}", flush=True)
+    return None
+
+
+def _stream_blob_video(blob_url: str, as_attachment: bool = False, filename: str = "tracked_video.mp4"):
+    """Stream a private Vercel Blob video to the browser with HTTP Range support."""
+    token = os.environ.get("BLOB_READ_WRITE_TOKEN", "") or BLOB_READ_WRITE_TOKEN
+    req_headers = {}
+    if token:
+        req_headers["Authorization"] = f"Bearer {token}"
+    if "Range" in request.headers:
+        req_headers["Range"] = request.headers["Range"]
+
+    try:
+        r = _requests.get(blob_url, headers=req_headers, stream=True, timeout=60)
+    except Exception as exc:
+        print(f"[Blob] Streaming proxy error: {exc}", flush=True)
+        abort(502)
+
+    resp_headers = {}
+    for h in ("Content-Type", "Content-Range", "Content-Length", "Accept-Ranges"):
+        if h in r.headers:
+            resp_headers[h] = r.headers[h]
+    if "Accept-Ranges" not in resp_headers:
+        resp_headers["Accept-Ranges"] = "bytes"
+    if as_attachment:
+        resp_headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+    return Response(
+        r.iter_content(chunk_size=128 * 1024),
+        status=r.status_code,
+        headers=resp_headers,
+        content_type=r.headers.get("Content-Type", "video/mp4"),
+    )
 
 
 def _validate_blob_url_ownership(blob_url: str, user_id: str, session_id: str) -> bool:
@@ -643,28 +717,39 @@ def analyze():
 
         job = db.create_job(user_id, session_id, orig_name)
 
-        t = threading.Thread(
-            target=_run_detection_worker,
-            args=(user_id, job["jobId"], session_id, input_path, output_path, report_path, orig_name, blob_url),
-            daemon=True,
-        )
-        with _threads_lock:
-            _active_threads[job["jobId"]] = t
-        t.start()
-
-        # Return immediately so Vercel doesn't burn the 800s budget on this
-        # request. The worker thread will update DB progress as it processes.
-        # The frontend polls /api/active-job every 1.5s to track progress.
-        return jsonify({
-            "sessionId": session_id,
-            "session_id": session_id,
-            "jobId": job["jobId"],
-            "status": "processing",
-            "filename": orig_name,
-            "stage": "Video received — starting AI pipeline...",
-            "progress": 5,
-            "userId": user_id,
-        })
+        # Run AI detection synchronously inside this HTTP request so Vercel keeps the
+        # serverless process active with dedicated CPU for the full maxDuration=800s.
+        # This completely eliminates the issue of background threads getting frozen.
+        try:
+            report = _run_detection_worker(
+                user_id=user_id,
+                job_id=job["jobId"],
+                session_id=session_id,
+                input_path=input_path,
+                output_path=output_path,
+                report_path=report_path,
+                orig_name=orig_name,
+                input_blob_url=blob_url,
+            )
+            return jsonify({
+                "sessionId": session_id,
+                "session_id": session_id,
+                "jobId": job["jobId"],
+                "status": "completed",
+                "filename": orig_name,
+                "stage": "Analysis complete!",
+                "progress": 100,
+                "userId": user_id,
+                "report": report,
+            })
+        except Exception as exc:
+            return jsonify({
+                "sessionId": session_id,
+                "session_id": session_id,
+                "jobId": job["jobId"],
+                "status": "failed",
+                "error": str(exc),
+            }), 500
 
     # ── Path B: Legacy multipart file upload (local dev / fallback) ──────────
     # This path allows the existing FormData upload to continue working locally.
@@ -701,24 +786,35 @@ def analyze():
 
     job = db.create_job(user_id, session_id, orig_name)
 
-    t = threading.Thread(
-        target=_run_detection_worker,
-        args=(user_id, job["jobId"], session_id, input_path, output_path, report_path, orig_name),
-        daemon=True,
-    )
-    with _threads_lock:
-        _active_threads[job["jobId"]] = t
-    t.start()
-
-    return jsonify({
-        "sessionId": session_id,
-        "session_id": session_id,
-        "jobId": job["jobId"],
-        "status": "processing",
-        "filename": orig_name,
-        "stage": "Upload received and validated",
-        "userId": user_id,
-    })
+    try:
+        report = _run_detection_worker(
+            user_id=user_id,
+            job_id=job["jobId"],
+            session_id=session_id,
+            input_path=input_path,
+            output_path=output_path,
+            report_path=report_path,
+            orig_name=orig_name,
+        )
+        return jsonify({
+            "sessionId": session_id,
+            "session_id": session_id,
+            "jobId": job["jobId"],
+            "status": "completed",
+            "filename": orig_name,
+            "stage": "Analysis complete!",
+            "progress": 100,
+            "userId": user_id,
+            "report": report,
+        })
+    except Exception as exc:
+        return jsonify({
+            "sessionId": session_id,
+            "session_id": session_id,
+            "jobId": job["jobId"],
+            "status": "failed",
+            "error": str(exc),
+        }), 500
 
 @app.route("/api/active-job")
 def active_job():
@@ -816,8 +912,11 @@ def video(session_id: str):
         abort(404)
 
     out_path = analysis.get("output_video")
-    if out_path and Path(out_path).exists():
-        return send_file(str(out_path), mimetype="video/mp4", conditional=True)
+    if out_path:
+        if out_path.startswith("http"):
+            return _stream_blob_video(out_path, as_attachment=False)
+        if Path(out_path).exists():
+            return send_file(str(out_path), mimetype="video/mp4", conditional=True)
 
     candidates = list(RESULTS_DIR.glob(f"{session_id}*.*"))
     if candidates:
@@ -834,8 +933,11 @@ def download_video(session_id: str):
     if not analysis:
         abort(404)
     out_path = analysis.get("output_video")
-    if out_path and Path(out_path).exists():
-        return send_file(str(out_path), as_attachment=True, download_name=f"tracked_{session_id}.mp4")
+    if out_path:
+        if out_path.startswith("http"):
+            return _stream_blob_video(out_path, as_attachment=True, filename=f"tracked_{session_id}.mp4")
+        if Path(out_path).exists():
+            return send_file(str(out_path), as_attachment=True, download_name=f"tracked_{session_id}.mp4")
     candidates = list(RESULTS_DIR.glob(f"{session_id}*.*"))
     if candidates:
         return send_file(str(candidates[0]), as_attachment=True, download_name=f"tracked_{session_id}.mp4")
@@ -850,14 +952,18 @@ def cleanup_video(session_id: str):
     if not analysis:
         return jsonify({"ok": False, "error": "Analysis not found"}), 404
 
-    # Remove temporary output video file
+    # Remove temporary output video file or blob
     out_path = analysis.get("output_video")
-    if out_path and Path(out_path).exists():
-        try:
-            Path(out_path).unlink()
-            print(f"[Storage] Safely cleaned up temporary output video after download: {out_path}", flush=True)
-        except Exception as e:
-            print(f"[Storage] Could not delete output video: {e}", flush=True)
+    if out_path:
+        if out_path.startswith("http"):
+            _delete_blob_object(out_path)
+            print(f"[Blob] Safely cleaned up temporary output blob after download: {out_path[:80]}", flush=True)
+        elif Path(out_path).exists():
+            try:
+                Path(out_path).unlink()
+                print(f"[Storage] Safely cleaned up temporary output video after download: {out_path}", flush=True)
+            except Exception as e:
+                print(f"[Storage] Could not delete output video: {e}", flush=True)
 
     for p in RESULTS_DIR.glob(f"{session_id}*.*"):
         try:
@@ -923,9 +1029,9 @@ def storage_stats():
     entries = db.get_user_history(user_id)
     retained = sum(1 for e in entries if e.get("videoAvailable", False))
 
-    in_size = sum(Path(e["input_video"]).stat().st_size for e in entries if e.get("input_video") and Path(e["input_video"]).exists())
-    out_size = sum(Path(e["output_video"]).stat().st_size for e in entries if e.get("output_video") and Path(e["output_video"]).exists())
-    rep_size = sum(Path(e["report_path"]).stat().st_size for e in entries if e.get("report_path") and Path(e["report_path"]).exists())
+    in_size = sum(Path(e["input_video"]).stat().st_size for e in entries if e.get("input_video") and not e["input_video"].startswith("http") and Path(e["input_video"]).exists())
+    out_size = sum(Path(e["output_video"]).stat().st_size for e in entries if e.get("output_video") and not e["output_video"].startswith("http") and Path(e["output_video"]).exists())
+    rep_size = sum(Path(e["report_path"]).stat().st_size for e in entries if e.get("report_path") and not e["report_path"].startswith("http") and Path(e["report_path"]).exists())
 
     return jsonify({
         "videos_in_bytes": in_size,
@@ -949,12 +1055,19 @@ def storage_cleanup():
         if not e.get("videoAvailable", False):
             for k in ("input_video", "output_video"):
                 p = e.get(k)
-                if p and p not in retained_outputs and Path(p).exists():
-                    try:
-                        Path(p).unlink()
-                        removed += 1
-                    except Exception:
-                        pass
+                if p and p not in retained_outputs:
+                    if p.startswith("http"):
+                        try:
+                            if _delete_blob_object(p):
+                                removed += 1
+                        except Exception:
+                            pass
+                    elif Path(p).exists():
+                        try:
+                            Path(p).unlink()
+                            removed += 1
+                        except Exception:
+                            pass
     return jsonify({"removed_files": removed})
 
 # ══════════════════════════════════════════════════════════════════════════════
