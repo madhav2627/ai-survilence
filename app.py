@@ -64,8 +64,9 @@ for d in [UPLOAD_DIR, RESULTS_DIR, REPORTS_DIR]:
 ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
 # Initialize Flask with frontend static serving
+# Initialize Flask with custom static serving
 FRONTEND_DIR = ROOT_DIR / "frontend"
-app = Flask(__name__, static_folder=str(FRONTEND_DIR), static_url_path="")
+app = Flask(__name__, static_folder=None)
 CORS(app, origins=["*"])
 
 @app.after_request
@@ -103,7 +104,7 @@ def safe_filename(name: str) -> str:
     return "".join(c if c in keep else "_" for c in name)[:100]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FRONTEND ROUTING
+# FRONTEND ROUTING (Clean URLs + Pages + Static Assets)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/")
@@ -132,23 +133,19 @@ PAGE_MAP = {
     "settings": "settings.html",
 }
 
-@app.route("/<path:page_name>")
-def named_page(page_name: str):
-    clean = page_name.strip("/")
-    direct_file = FRONTEND_DIR / clean
-    if direct_file.is_file():
-        return send_from_directory(str(FRONTEND_DIR), clean)
-    base = clean[:-5] if clean.endswith(".html") else clean
-    if base in PAGE_MAP:
-        return send_from_directory(str(FRONTEND_DIR / "pages"), PAGE_MAP[base])
-    page_file = FRONTEND_DIR / "pages" / clean
-    if page_file.is_file():
-        return send_from_directory(str(FRONTEND_DIR / "pages"), clean)
-    if not clean.endswith(".html"):
-        page_html = FRONTEND_DIR / "pages" / f"{clean}.html"
-        if page_html.is_file():
-            return send_from_directory(str(FRONTEND_DIR / "pages"), f"{clean}.html")
-    abort(404)
+for _route_name, _html_target in PAGE_MAP.items():
+    def _create_page_handler(target_file):
+        return lambda: send_from_directory(str(FRONTEND_DIR / "pages"), target_file)
+    app.add_url_rule(f"/{_route_name}", f"view_{_route_name}", _create_page_handler(_html_target))
+    app.add_url_rule(f"/{_route_name}.html", f"view_{_route_name}_html", _create_page_handler(_html_target))
+
+@app.route("/background.png")
+def serve_bg():
+    return send_from_directory(str(FRONTEND_DIR), "background.png")
+
+@app.route("/right_side.png")
+def serve_right_side():
+    return send_from_directory(str(FRONTEND_DIR), "right_side.png")
 
 @app.route("/pages/<path:filename>")
 def pages_dir(filename: str):
